@@ -4,6 +4,8 @@
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
 dir = fso.GetParentFolderName(WScript.ScriptFullName)
+' Concurrent GC for powershell.exe (off by default): big memory cleanups don't freeze the island's animations
+sh.Environment("Process")("COMPlus_gcConcurrent") = "1"
 cmd = "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & dir & "\island.ps1"""
 restarts = 0
 Do

@@ -24,6 +24,8 @@ and what's playing, instead of the toasts in the bottom-right corner.
   get **furigana** and **romaji** (needs Japanese added in Windows: Settings > Time & language >
   Language & region > Add a language). Songs that only have plain lyrics show them line by line at an
   estimated pace. Lyrics you've already played are kept on your PC, so they load instantly next time.
+  The little music icon next to the cover comes in several styles: bars, wave, spectrum, bouncing dots
+  or a spinning vinyl record, or a different one for each song.
 - **Full lyrics page**: swipe to the third page of the list to see all the lyrics scrolling along with
   the song. Click a line to jump to it. Pin it to keep the island open, and turn furigana / romaji on or
   off for Japanese lyrics.
@@ -40,6 +42,7 @@ and what's playing, instead of the toasts in the bottom-right corner.
   and saved lyrics, and restarts itself.
 - **English or Indonesian** interface, and a choice of monitor if you have more than one.
 - Stays on top of other windows, but steps aside for fullscreen games and videos.
+- Smooth: animations run at your screen's refresh rate.
 - Light: well under 1% of your CPU when nothing is playing, about 2-3% while music plays (measured on a
   6-core PC with a 180 Hz screen), and about 45 MB of memory when idle.
 
@@ -71,6 +74,8 @@ Double-click **`Uninstall.cmd`** (in the downloaded folder or in `%LOCALAPPDATA%
 - Timer (1-60 minutes) and stopwatch
 - Show: volume & brightness changes, charging & low battery, microphone / camera dots, Bluetooth
   headset, album color glow
+- Music icon: bars, wave, spectrum, dots, vinyl record, or shuffle per song (the menu stays open so you
+  can try each one)
 - Monitor, language, check for updates, restart, quit
 
 **Lyric timing for one song**: scroll on the lyrics button of the music card. It is remembered for
