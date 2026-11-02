@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.2'
+$APP_VERSION = '1.3.3'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -316,9 +316,9 @@ public class IslandWave {
         pows = new[] { 1.0, 1.0, 1.0 };
         amps = new[] { 11.0 * scale * ampScale, 8.5 * scale * ampScale, 6.5 * scale * ampScale };
         // Semua lapis mengalir sama cepat (beda kecepatan membuat bentuknya acak dan janggal)
-        speeds = new[] { 22.0 * scale, 22.0 * scale, 22.0 * scale };
+        speeds = new[] { 38.0 * scale, 38.0 * scale, 38.0 * scale };
         shifts = new[] { 0.0, 47 * scale, 21 * scale };
-        breathW = new[] { 0.55, 0.83, 1.07 };
+        breathW = new[] { 0.8, 1.2, 1.55 };
         breathP = new[] { 0.0, 2.1, 4.0 };
         Root.Height = h; Root.ClipToBounds = true; Root.IsHitTestVisible = false;
         paths = new Path[3];
@@ -1890,6 +1890,7 @@ function Switch-BottomRow {
     $old = $hostG.Children[$hostG.Children.Count - 1]
     $script:volumeMode = -not $script:volumeMode
     $script:volUI = $null; $script:progressBars = @()
+    $script:musicCard = $null
     $new = New-BottomRow
     [void]$hostG.Children.Add($new)
     $old.IsHitTestVisible = $false
@@ -3770,18 +3771,25 @@ function New-LyricsPage {
     $tt = New-Object System.Windows.Media.TranslateTransform
     $sp.RenderTransform = $tt
     $estimated = $lines.Count -and $lines[0].Estimated
-    $japanese = @($lines | Where-Object { $_.Text -match $JAPANESE }).Count -gt 0
+    # Catatan: jangan dinamai $japanese - nama variabel PowerShell tidak peka huruf besar/kecil, jadi
+    # variabel itu menimpa pola $JAPANESE untuk fungsi ini dan fungsi yang dipanggilnya
+    $hasJapanese = @($lines | Where-Object { $_.Text -match $JAPANESE }).Count -gt 0
     $blocks = New-Object System.Collections.Generic.List[object]
     $pageRuby = New-Object System.Windows.Media.ScaleTransform(1, $(if ($script:settings.Furigana) { 1 } else { 0 }))
     $pageRomaji = New-Object System.Windows.Media.ScaleTransform(1, $(if ($script:settings.Romaji) { 1 } else { 0 }))
     # Set-PageLine di bawah sudah butuh skala ini (halaman lengkapnya diisi setelah semua baris dibuat)
     $script:lyricsPage = @{ RubyScale = $pageRuby; RomajiScale = $pageRomaji }
+    # Baris di sekitar baris aktif langsung lengkap (furigana/romaji); sisanya teks biasa dulu, dilengkapi
+    # bertahap saat island senggang. Membangun semua baris sekaligus membuat geser ke halaman ini tersendat.
+    $c0 = [Math]::Max(0, (Find-LyricLine $lines ((Get-SongPos) - (Get-LyricDelay))))
+    $li = -1
     foreach ($l in $lines) {
+        $li++
         $blk = New-Object System.Windows.Controls.StackPanel
         $blk.Margin = '18,5,18,5'; $blk.Background = Brush '#01000000'
         $blk.Tag = [PSCustomObject]@{ Line = $l; Brush = (New-Object System.Windows.Media.SolidColorBrush($DIM_LINE)); Parts = $null; Rubies = $null; Romaji = $null }
         # Furigana/romaji yang sudah pernah dihitung (mis. oleh mini island) langsung dipakai
-        $ready = if ($japanese -and $l.PSObject.Properties['Parts'] -and $l.PartsVer -eq $script:partsVer) { $l.Parts } else { $null }
+        $ready = if ($hasJapanese -and [Math]::Abs($li - $c0) -le 3 -and $l.Text -match $JAPANESE) { Get-LineParts $l } else { $null }
         Set-PageLine $blk $ready
         # Lirik biasa hanya taksiran waktu: tidak bisa dipakai untuk lompat (begitu juga pemutar yang tidak mengizinkannya)
         if (-not $estimated -and (Test-MediaSeekable)) {
@@ -3810,7 +3818,7 @@ function New-LyricsPage {
     $bar = New-Object System.Windows.Controls.StackPanel
     $bar.Orientation = 'Horizontal'; $bar.HorizontalAlignment = 'Right'; $bar.VerticalAlignment = 'Top'; $bar.Margin = '0,8,8,0'
     $script:furiButton = $null; $script:romajiButton = $null
-    if ($japanese) {
+    if ($hasJapanese) {
         $fb = New-PageToggle ([string][char]0x3042) (T 'Furigana' 'Furigana') $script:settings.Furigana
         $fb.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Toggle-LyricOption 'Furigana' })
         [void]$bar.Children.Add($fb); $script:furiButton = $fb
@@ -3826,19 +3834,59 @@ function New-LyricsPage {
     [void]$layers.Children.Add($bar)
 
     $script:lyricsPage = @{ Lines = $lines; Blocks = $blocks; Tops = $null; Shift = $tt; Cur = -2; Root = $card; Panel = $sp
-        RubyScale = $pageRuby; RomajiScale = $pageRomaji; Layers = $layers; Fade = $fade
-        Pending = $(if ($japanese) { New-Object System.Collections.Generic.List[int] } else { $null }) }
+        RubyScale = $pageRuby; RomajiScale = $pageRomaji; Layers = $layers; Fade = $fade; Lives = @{ Furigana = @(); Romaji = @() }
+        FuriButton = $script:furiButton; RomajiButton = $script:romajiButton; PinButton = $script:pinButton
+        Pending = $(if ($hasJapanese) { New-Object System.Collections.Generic.List[int] } else { $null }) }
     Measure-LyricsPage
     Update-LyricsPage -Instant
+    $script:lpCache = @{ Key = (Get-LyricsPageKey); LP = $script:lyricsPage }
     $lyricsPageTimer.Start()
-    if ($japanese) { Queue-PageParts; $pagePartsTimer.Start() }
+    if ($hasJapanese) { Schedule-PageWindow $script:lyricsPage }
     $card
 }
+
+# Halaman lirik lagu ini disimpan dan dipakai ulang (geser bolak-balik tidak membangun ulang). Kunci:
+# lagu, jumlah baris, dan pengaturan furigana/romaji saat halaman dibuat.
+$script:lpCache = $null
+function Get-LyricsPageKey { "$($script:media.Key)|$((Get-Lyrics).Count)|$($script:settings.Furigana)|$($script:settings.Romaji)|$($script:settings.Language)" }
+function Get-LyricsCard {
+    $c = $script:lpCache
+    if (-not ($c -and $c.Key -eq (Get-LyricsPageKey))) { return New-LyricsPage }
+    $lp = $c.LP
+    $script:lyricsPage = $lp
+    $script:furiButton = $lp.FuriButton; $script:romajiButton = $lp.RomajiButton; $script:pinButton = $lp.PinButton
+    Update-PageToggles
+    # Baris yang dilengkapi di latar mengubah tinggi baris. Baris aktif dipusatkan setelah WPF selesai
+    # menata halaman (sebelum terlihat: halaman masuk dari transparan), jadi tidak diukur dua kali.
+    $lp.Cur = -2
+    [void]$window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Loaded, [Action]{
+        if ($script:lyricsPage) { Measure-LyricsPage; $script:lyricsPage.Cur = -2; Update-LyricsPage -Instant }
+    })
+    $lyricsPageTimer.Start()
+    if ($lp.Pending -and $lp.Pending.Count) { $pagePartsTimer.Start() }
+    $lp.Root
+}
+
+# Halaman musik terbuka dan lagunya punya lirik: halaman lirik disiapkan di sela-sela frame (prioritas
+# Background; ApplicationIdle tidak pernah jalan selama ada animasi yang terus berjalan), jadi
+# saat digeser ke kanan halamannya sudah jadi
+$lyricsPrebuildTimer = New-Object System.Windows.Threading.DispatcherTimer([System.Windows.Threading.DispatcherPriority]::Background)
+$lyricsPrebuildTimer.Interval = Ms 600
+$lyricsPrebuildTimer.Add_Tick({
+    $lyricsPrebuildTimer.Stop()
+    if ($script:mode -ne 'list' -or $script:listPage -eq 'lyrics' -or -not $script:media -or -not (Get-Lyrics)) { return }
+    $c = $script:lpCache
+    if ($c -and $c.Key -eq (Get-LyricsPageKey)) { return }
+    try { [void](New-LyricsPage) } catch { Log "lyrics prebuild: $_" }
+    # Halaman yang sedang tampil bukan halaman lirik
+    $script:lyricsPage = $null
+})
 
 # Posisi atas tiap baris (dihitung ulang setiap tinggi baris berubah karena furigana/romaji)
 function Measure-LyricsPage {
     $lp = $script:lyricsPage
-    $lp.Panel.Measure((New-Object System.Windows.Size(($WIDE_W - 18), [double]::PositiveInfinity)))
+    # Ukur sendiri hanya kalau WPF belum mengukur ulang (mengukur semua baris itu mahal)
+    if (-not $lp.Panel.IsMeasureValid) { $lp.Panel.Measure((New-Object System.Windows.Size(($WIDE_W - 18), [double]::PositiveInfinity))) }
     $tops = New-Object System.Collections.Generic.List[double]
     $heights = New-Object System.Collections.Generic.List[double]
     $y = 0.0
@@ -3853,27 +3901,24 @@ function Get-LyricsPageTarget($lp, $idx) {
     $LYRICS_PAGE_H / 2 - ($lp.Tops[$i] + $lp.Heights[$i] / 2)
 }
 
-# Urutan baris yang furigana/romaji-nya dihitung: dari baris sekarang ke bawah, lalu ke atas
-function Queue-PageParts {
-    $lp = $script:lyricsPage
-    $pos = (Get-SongPos) - (Get-LyricDelay)
-    $c = [Math]::Max(0, (Find-LyricLine $lp.Lines $pos))
-    $lp.Pending.Clear()
-    for ($i = $c; $i -lt $lp.Blocks.Count; $i++) { $lp.Pending.Add($i) }
-    for ($i = $c - 1; $i -ge 0; $i--) { $lp.Pending.Add($i) }
-}
 
 $pagePartsTimer = New-Object System.Windows.Threading.DispatcherTimer([System.Windows.Threading.DispatcherPriority]::Background)
-$pagePartsTimer.Interval = Ms 15
+$pagePartsTimer.Interval = Ms 4
 $pagePartsTimer.Add_Tick({
-    $lp = $script:lyricsPage
-    if (-not $lp -or -not $lp.Pending -or $lp.Pending.Count -eq 0 -or $script:mode -ne 'list' -or $script:listPage -ne 'lyrics') { $pagePartsTimer.Stop(); return }
-    # Beberapa baris per tick (masing-masing beberapa ms), lalu posisi digeser supaya baris aktif tidak melompat
-    for ($n = 0; $n -lt 3 -and $lp.Pending.Count; $n++) {
-        $i = $lp.Pending[0]; $lp.Pending.RemoveAt(0)
+    $lp = if ($script:lpCache) { $script:lpCache.LP } else { $null }
+    if (-not $lp -or -not $lp.Pending -or $lp.Pending.Count -eq 0 -or $script:mode -ne 'list') { $pagePartsTimer.Stop(); return }
+    $visible = [object]::ReferenceEquals($lp, $script:lyricsPage)
+    if ($visible -and $lp.ScrollUntil -and (Get-Date) -lt $lp.ScrollUntil) { return }
+    # Satu baris per tick (beberapa ms) supaya frame animasi tidak terlewat
+    $i = $lp.Pending[0]; $lp.Pending.RemoveAt(0)
+    if ($i -ge 0) {
         $blk = $lp.Blocks[$i]
-        if ($blk.Tag.Line.Text -match $JAPANESE) { Set-PageLine $blk (Get-LineParts $blk.Tag.Line) -Fade }
+        if (-not $blk.Tag.Parts) { Set-PageLine $blk (Get-LineParts $blk.Tag.Line) -Fade:$visible }
+    } else {
+        $blk = $lp.Blocks[-1 - $i]
+        if ($blk.Tag.Parts) { Set-PageLine $blk $null }
     }
+    if (-not $visible) { return }
     # Baris yang terisi kebanyakan di luar kartu; baris aktif dikunci di tengah (tanpa animasi gulir yang
     # dimulai ulang tiap batch, yang membuat halaman bergoyang naik-turun)
     Measure-LyricsPage
@@ -3907,7 +3952,30 @@ function Update-LyricsPage([switch]$Instant) {
     $target = Get-LyricsPageTarget $lp $idx
     $yp = [System.Windows.Media.TranslateTransform]::YProperty
     if ($Instant) { $lp.Shift.BeginAnimation($yp, $null); $lp.Shift.Y = $target }
-    else { Animate60 $lp.Shift $yp $lp.Shift.Y $target 520 }
+    else { Animate60 $lp.Shift $yp $lp.Shift.Y $target 520; $lp.ScrollUntil = (Get-Date).AddMilliseconds(560) }
+    Schedule-PageWindow $lp
+}
+
+# Jendela baris lengkap: hanya baris di sekitar baris aktif (+-$PAGE_WINDOW) yang memakai furigana/romaji;
+# baris jauh berupa teks biasa. Halaman jadi jauh lebih ringan ditata (geser ke halaman ini tidak tersendat).
+$PAGE_WINDOW = 4
+function Schedule-PageWindow($lp) {
+    if (-not $lp.Pending) { return }
+    $c = [Math]::Max(0, $lp.Cur)
+    $n = $lp.Blocks.Count
+    $lp.Pending.Clear()
+    for ($d = 0; $d -le $PAGE_WINDOW; $d++) {
+        foreach ($i in ($c + $d), ($c - $d)) {
+            if ($i -lt 0 -or $i -ge $n -or $lp.Pending.Contains($i)) { continue }
+            $t = $lp.Blocks[$i].Tag
+            if (-not $t.Parts -and $t.Line.Text -match $JAPANESE) { $lp.Pending.Add($i) }
+        }
+    }
+    # Baris lengkap yang sudah jauh dikembalikan ke teks biasa
+    for ($i = 0; $i -lt $n; $i++) {
+        if ([Math]::Abs($i - $c) -gt $PAGE_WINDOW + 2 -and $lp.Blocks[$i].Tag.Parts -and -not $lp.Pending.Contains(-1 - $i)) { $lp.Pending.Add(-1 - $i) }
+    }
+    if ($lp.Pending.Count) { $pagePartsTimer.Start() }
 }
 
 # Baris aktif dicek selama halaman lirik terbuka
@@ -3918,9 +3986,9 @@ $lyricsPageTimer.Add_Tick({ Update-LyricsPage })
 # Furigana / romaji nyala-mati (berlaku juga untuk mini island)
 # Di halaman lirik tidak dibangun ulang: yang dimatikan memudar keluar dulu, yang dinyalakan memudar masuk,
 # baris-baris bergeser halus ke posisi barunya.
-# Di halaman lirik: tampilan sekarang difoto, tata letak baru dipasang sekaligus (baris aktif tetap di
-# tengah), lalu foto lama memudar keluar sementara tampilan baru memudar masuk. Tidak ada guliran
-# naik-turun, dan tata letak hanya dihitung sekali (bukan tiap frame).
+# Di halaman lirik: furigana/romaji di baris yang terlihat memanjang/memendek sambil memudar (skala
+# tata letak dianimasikan), baris di luar kartu langsung berubah. Baris aktif dikunci di tengah setiap
+# kali tata letak selesai dihitung (LayoutUpdated, sebelum frame digambar), jadi tidak pernah meloncat.
 function Toggle-LyricOption($name) {
     $on = -not $script:settings.$name
     $script:settings.$name = $on
@@ -3928,45 +3996,53 @@ function Toggle-LyricOption($name) {
     $script:lyricIdx = -2
     $lp = $script:lyricsPage
     if (-not ($lp -and $script:mode -eq 'list' -and $script:listPage -eq 'lyrics')) { return }
-    $snap = $null
-    try {
-        $k = 1.0
-        $src = [System.Windows.PresentationSource]::FromVisual($window)
-        if ($src) { $k = $src.CompositionTarget.TransformToDevice.M11 }
-        $w = [int][Math]::Ceiling($lp.Layers.ActualWidth * $k); $h = [int][Math]::Ceiling($lp.Layers.ActualHeight * $k)
-        if ($w -gt 0 -and $h -gt 0) {
-            $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($w, $h, (96 * $k), (96 * $k), [System.Windows.Media.PixelFormats]::Pbgra32)
-            $rtb.Render($lp.Layers); $rtb.Freeze()
-            $snap = New-Object System.Windows.Controls.Image
-            $snap.Source = $rtb; $snap.Stretch = 'None'; $snap.IsHitTestVisible = $false
-            $snap.HorizontalAlignment = 'Left'; $snap.VerticalAlignment = 'Top'
-        }
-    } catch { Log "lyrics snapshot: $_" }
     Update-PageToggles
-    $sc = if ($name -eq 'Furigana') { $lp.RubyScale } else { $lp.RomajiScale }
-    $sc.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $null)
-    $sc.ScaleY = $(if ($on) { 1.0 } else { 0.0 })
-    # Tata letak baru dihitung sekarang juga (bukan di frame berikutnya), supaya posisi tengahnya tepat
-    $lp.Panel.UpdateLayout()
-    Measure-LyricsPage
-    $yp = [System.Windows.Media.TranslateTransform]::YProperty
-    $lp.Shift.BeginAnimation($yp, $null)
-    $lp.Shift.Y = Get-LyricsPageTarget $lp $lp.Cur
-    $op = [System.Windows.UIElement]::OpacityProperty
-    if ($snap) {
-        [void]$lp.Layers.Children.Add($snap)
-        Animate60 $snap $op 1.0 0.0 300
-        $script:lyricsSnap = $snap
-        $snapTimer.Stop(); $snapTimer.Start()
+    if ($script:lpCache -and [object]::ReferenceEquals($script:lpCache.LP, $lp)) { $script:lpCache.Key = Get-LyricsPageKey }
+    $prop = [System.Windows.Media.ScaleTransform]::ScaleYProperty
+    $final = if ($on) { 1.0 } else { 0.0 }
+    $static = if ($name -eq 'Furigana') { $lp.RubyScale } else { $lp.RomajiScale }
+    $from = [double]$static.ScaleY
+    # Skala bersama (baris di luar kartu) dan skala animasi sebelumnya langsung ke nilai akhir
+    $static.BeginAnimation($prop, $null); $static.ScaleY = $final
+    foreach ($old in @($lp.Lives[$name])) { $old.BeginAnimation($prop, $null); $old.ScaleY = $final }
+    # Baris yang terlihat (plus sedikit di atas/bawah kartu) memakai skala animasi sendiri
+    $live = New-Object System.Windows.Media.ScaleTransform(1, $from)
+    $lp.Lives[$name] = @($live)
+    for ($i = 0; $i -lt $lp.Blocks.Count; $i++) {
+        $top = $lp.Tops[$i] + $lp.Shift.Y
+        if ($top -gt $LYRICS_PAGE_H + 40 -or $top + $lp.Heights[$i] -lt -40) { continue }
+        $tag = $lp.Blocks[$i].Tag
+        $els = if ($name -eq 'Furigana') { $tag.Rubies } elseif ($tag.Romaji) { @($tag.Romaji.Child) } else { @() }
+        foreach ($el in $els) { Use-PageScale $el $live }
     }
-    Animate60 $lp.Fade $op 0.0 1.0 300
+    if (-not $script:following) { $script:following = $true; $lp.Panel.add_LayoutUpdated($followHandler) }
+    Animate60 $live $prop $from $final 340
+    $followTimer.Stop(); $followTimer.Start()
 }
-$snapTimer = New-Object System.Windows.Threading.DispatcherTimer
-$snapTimer.Interval = Ms 320
-$snapTimer.Add_Tick({
-    $snapTimer.Stop()
-    $sn = $script:lyricsSnap; $script:lyricsSnap = $null
-    if ($sn -and $sn.Parent) { $sn.Parent.Children.Remove($sn) }
+
+# Selama animasi: baris aktif tetap di tengah. LayoutUpdated jalan setelah tata letak frame ini selesai
+# dan sebelum digambar, jadi geseran yang diatur di sini ikut frame yang sama (tanpa tertinggal).
+$script:following = $false
+$followHandler = [EventHandler]{
+    $lp = $script:lyricsPage
+    if (-not $lp) { return }
+    $b = $lp.Blocks[[Math]::Max(0, $lp.Cur)]
+    try {
+        $p = $b.TranslatePoint((New-Object System.Windows.Point(0, 0)), $lp.Panel)
+        $lp.Shift.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null)
+        $lp.Shift.Y = $LYRICS_PAGE_H / 2 - ($p.Y + $b.ActualHeight / 2)
+    } catch {}
+}
+$followTimer = New-Object System.Windows.Threading.DispatcherTimer
+$followTimer.Interval = Ms 400
+$followTimer.Add_Tick({
+    $followTimer.Stop()
+    $lp = $script:lyricsPage
+    if ($script:following) {
+        $script:following = $false
+        if ($lp) { $lp.Panel.remove_LayoutUpdated($followHandler) }
+    }
+    if ($lp) { Measure-LyricsPage }
 })
 
 # Tampilan tombol pojok halaman lirik mengikuti pengaturan (tanpa membangun ulang halaman)
@@ -3993,6 +4069,35 @@ function Toggle-ListPin {
     if (-not $script:listPinned -and -not $script:hovering -and -not $script:overHot) { $closeTimer.Start() }
 }
 
+# Kartu musik di daftar disimpan dan dipakai ulang selama lagu & keadaannya sama (geser bolak-balik antar
+# halaman tidak membangun ulang cover, tombol, dan gelombang). Progress-nya diselaraskan lagi saat tampil.
+$script:musicCard = $null
+function Get-MusicCardKey {
+    $m = $script:media
+    "$($m.Key)|$($m.Playing)|$($m.End -gt 0)|$($script:volumeMode)|$($script:settings.Lyrics)|$($script:settings.Language)"
+}
+function Get-MusicCard {
+    $c = $script:musicCard
+    if ($c -and $c.Key -eq (Get-MusicCardKey)) {
+        $card = $c.Card
+        if ($card.Parent) { $card.Parent.Children.Remove($card) }
+        $card.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null); $card.Opacity = 1
+        $card.RenderTransform = [System.Windows.Media.Transform]::Identity
+        $script:progressBars = $c.Bars; $script:bottomHost = $c.BottomHost; $script:volUI = $c.VolUI
+        foreach ($pb in $script:progressBars) { Start-Progress $pb }
+        Update-VolumeUI
+        $progressClock.Start()
+        return $card
+    }
+    $card = New-Object System.Windows.Controls.Border
+    $card.MinHeight = 56; $card.Padding = '0,4,0,0'; $card.ClipToBounds = $true
+    $card.CornerRadius = New-Object System.Windows.CornerRadius(14)
+    $card.Background = Row-Brush $script:media.Accent $true
+    $card.Child = New-MediaContent
+    $script:musicCard = @{ Key = (Get-MusicCardKey); Card = $card; Bars = $script:progressBars; BottomHost = $script:bottomHost; VolUI = $script:volUI }
+    $card
+}
+
 function Show-List([switch]$Refresh) {
     $script:mode = 'list'
     if (-not $Refresh) { $script:volumeMode = $false }
@@ -4016,11 +4121,7 @@ function Show-List([switch]$Refresh) {
     if ($script:clock) { [void]$listPanel.Children.Add((New-ClockRow)) }
     if ($script:listPage -eq 'music') {
         Set-Theme $script:media.Accent
-        $card = New-Object System.Windows.Controls.Border
-        $card.MinHeight = 56; $card.Padding = '0,4,0,0'; $card.ClipToBounds = $true
-        $card.CornerRadius = New-Object System.Windows.CornerRadius(14)
-        $card.Background = Row-Brush $script:media.Accent $true
-        $card.Child = New-MediaContent
+        $card = Get-MusicCard
         [void]$listPanel.Children.Add($card)
         # Lagu berganti saat halaman musik terbuka: kartu baru memudar masuk dengan halus di tempat
         if ($Refresh -and $prevPage -eq 'music' -and $script:listMediaKey -and $script:listMediaKey -ne $script:media.Key) {
@@ -4030,7 +4131,9 @@ function Show-List([switch]$Refresh) {
         $script:listMediaKey = $script:media.Key
     } elseif ($script:listPage -eq 'lyrics') {
         Set-Theme $script:media.Accent
-        [void]$listPanel.Children.Add((New-LyricsPage))
+        $lc = Get-LyricsCard
+        if ($lc.Parent) { $lc.Parent.Children.Remove($lc) }
+        [void]$listPanel.Children.Add($lc)
     } elseif ($items.Count -eq 0) {
         $t = New-Object System.Windows.Controls.TextBlock
         $t.Text = T 'Tidak ada notifikasi' 'No notifications'
@@ -4120,6 +4223,8 @@ function Show-List([switch]$Refresh) {
     # Titik halaman hanya kalau memang ada dua halaman
     $script:pageDots = $null
     if ($pages.Count -gt 1) { $script:pageDots = New-PageDots; [void]$listPanel.Children.Add($script:pageDots) }
+    # Halaman lirik disiapkan di latar dari halaman mana pun (notifikasi atau musik), siap sebelum digeser ke sana
+    if ($script:listPage -ne 'lyrics' -and $pages -contains 'lyrics') { $lyricsPrebuildTimer.Stop(); $lyricsPrebuildTimer.Start() }
     $listPanel.Measure((New-Object System.Windows.Size(($WIDE_W - 2), [double]::PositiveInfinity)))
     $h = [Math]::Min($MAX_ISLAND_H, [Math]::Max(56, [Math]::Ceiling($listPanel.DesiredSize.Height) + 2))
     Resize-Island $WIDE_W $h 24
@@ -5043,6 +5148,10 @@ $cleanupTimer.Add_Tick({
     if ($script:mode -eq 'idle') {
         $mediaView.Child = $null; $listPanel.Children.Clear(); $nIconHost.Child = $null
         $script:volUI = $null; $script:progressBars = @()
+        # Halaman lirik & kartu musik yang disimpan hanya berguna selama daftar terbuka; dilepas supaya
+        # memorinya bisa dikembalikan (dibangun lagi saat daftar dibuka berikutnya)
+        $script:musicCard = $null; $script:lpCache = $null; $script:lyricsPage = $null
+        $pagePartsTimer.Stop(); $lyricsPrebuildTimer.Stop()
     }
     # Mini island tersembunyi (tidak ada lirik) juga dikosongkan supaya equalizer-nya tidak jalan di latar
     if (-not $script:miniOn -or -not $script:miniVisible) { $views['MiniView'].Children.Clear() }
