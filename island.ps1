@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.4'
+$APP_VERSION = '1.3.5'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -284,10 +284,10 @@ public static class IslandFast {
     }
 }
 '@
-# Gelombang progress digambar ulang tiap frame (maks ~60 fps) dalam C#: bukit-bukit tembus pandang yang
-# mengalir dan naik-turun pelan, tingginya menyusut mulus ke nol di awal bar dan menjelang titik posisi lagu
-# (tanpa masker/potongan). Hanya menggambar selama elemennya tampil di jendela (Loaded/Unloaded), jadi tidak
-# ada animasi yang tertinggal jalan di latar.
+# Gelombang progress digambar ulang tiap frame dalam C#: empat lapis bukit tembus pandang yang masing-masing
+# bergerak sendiri (panjang bukit, tinggi, kecepatan, dan bentangnya berbeda), menyusut mulus ke nol di ujung-
+# ujungnya (tanpa masker/potongan). Hanya menggambar selama elemennya tampil di jendela (Loaded/Unloaded), jadi
+# tidak ada animasi yang tertinggal jalan di latar.
 Add-IslandType -Refs $WPF_REFS @'
 using System;
 using System.Diagnostics;
@@ -299,49 +299,62 @@ public class IslandWave {
     public readonly Grid Root = new Grid();
     public bool Playing = true;
     readonly Path[] paths;
-    readonly double[] lens, pows, amps, speeds, shifts, breathW, breathP;
+    readonly double[] lens, lens2, speeds, speeds2, shifts, shifts2, sharp, amps, breathW, breathP, starts, ends;
+    readonly byte[] topA, footA;
     readonly TranslateTransform knob;
-    readonly double knobHalf, h, baseY, taper, fadeIn, fullAt;
+    readonly double knobHalf, h, baseY, taper;
     readonly Stopwatch clock = Stopwatch.StartNew();
     double lastDraw = -1, frozenT = -1, lastX = -1;
     // Jeda minimum antar gambar (detik); diatur island sesuai refresh rate layar
     public static double FrameTime = 0.0155;
     bool hooked;
-    // Tinggi tiap lapis terhadap garis luar bersama, dan wadah garis luar itu (dipakai ulang tiap frame)
-    static readonly double[] nest = { 1.0, 0.70, 0.45 };
-    double[] prof = new double[0];
-    // Satu pola bukit (0..1) lapis j di posisi x pada waktu t
-    double Wave(double x, double t, int j) { return (1 - Math.Cos(2 * Math.PI * (x - speeds[j] * t + shifts[j]) / lens[j])) / 2; }
-    // Maksimum dua nilai dengan sudut yang dibulatkan selebar k (polynomial smooth max)
-    static double SMax(double a, double b, double k) { double d = Math.Max(k - Math.Abs(a - b), 0) / k; return Math.Max(a, b) + d * d * k * 0.25; }
+    // Lapis j (0..1) di posisi x pada waktu t: gelombang utama ditambah riak yang lebih pendek dan sedikit lebih
+    // cepat, jadi bentuknya terus berubah pelan seperti air (bukan pola yang sama digeser). Dipangkatkan sedikit:
+    // puncak agak runcing, lembah landai.
+    double Wave(double x, double t, int j) {
+        double a = (1 - Math.Cos(2 * Math.PI * (x - speeds[j] * t + shifts[j]) / lens[j])) / 2;
+        double b = (1 - Math.Cos(2 * Math.PI * (x - speeds2[j] * t + shifts2[j]) / lens2[j])) / 2;
+        return Math.Pow(0.7 * a + 0.3 * b, sharp[j]);
+    }
 
     // ampScale: tinggi bukit saja (kartu musik sedikit lebih tinggi dari versi kecil di mini island)
     public IslandWave(double h, double baseY, double scale, double ampScale, Color[] colors, TranslateTransform knob, double knobHalf) {
         this.h = h; this.baseY = baseY; this.knob = knob; this.knobHalf = knobHalf;
-        // Naik landai di awal bar dan turun landai menjelang titik (bukan tebing)
-        taper = 50 * scale; fadeIn = 50 * scale; fullAt = 90 * scale;
-        // Lebar bukit, kerampingan, tinggi, kecepatan (px/detik) per lapis; sengaja tidak sebanding
-        lens = new[] { 170 * scale, 124 * scale, 92 * scale };
-        // Pangkat 1 = gelombang sinus murni (puncak bulat). Pangkat > 1 membuat puncak runcing.
-        pows = new[] { 1.0, 1.0, 1.0 };
-        amps = new[] { 11.0 * scale * ampScale, 8.5 * scale * ampScale, 6.5 * scale * ampScale };
-        // Semua lapis mengalir sama cepat (beda kecepatan membuat bentuknya acak dan janggal)
-        speeds = new[] { 38.0 * scale, 38.0 * scale, 38.0 * scale };
-        shifts = new[] { 0.0, 47 * scale, 21 * scale };
-        breathW = new[] { 0.8, 1.2, 1.55 };
-        breathP = new[] { 0.0, 2.1, 4.0 };
+        // Naik landai di awal tiap lapis dan turun landai di ujungnya (bukan tebing)
+        taper = 28 * scale;
+        // Tiap lapis sengaja berbeda supaya tidak tampak seperti salinan: bukit lapis belakang paling panjang dan
+        // alirannya paling lambat (kesan kedalaman), lapis depan lebih pendek dan cepat. Tingginya hampir sama,
+        // jadi bukit tiap warna bergantian muncul di garis luar gelombang. Lapis paling belakang berwarna pucat
+        // dan lebih tembus pandang, seperti gelombang yang jauh.
+        lens = new[] { 124 * scale, 96 * scale, 74 * scale, 58 * scale };
+        lens2 = new[] { 71 * scale, 57 * scale, 43 * scale, 33 * scale };
+        amps = new[] { 11.0 * scale * ampScale, 10.0 * scale * ampScale, 9.0 * scale * ampScale, 8.0 * scale * ampScale };
+        speeds = new[] { 20.0 * scale, 26.0 * scale, 34.0 * scale, 42.0 * scale };
+        speeds2 = new[] { 27.0 * scale, 34.0 * scale, 45.0 * scale, 55.0 * scale };
+        shifts = new[] { 13 * scale, 0.0, 31 * scale, 17 * scale };
+        shifts2 = new[] { 48 * scale, 22 * scale, 9 * scale, 40 * scale };
+        sharp = new[] { 1.2, 1.3, 1.4, 1.5 };
+        breathW = new[] { 0.6, 0.8, 1.2, 1.55 };
+        breathP = new[] { 1.0, 0.0, 2.1, 4.0 };
+        // Bentang tiap lapis (bagian dari panjang bar): lapis belakang dari awal bar sampai titik, lapis depan
+        // mulai lebih ke kanan dan berhenti lebih awal, jadi ujung-ujungnya tidak sejajar
+        starts = new[] { 0.0, 0.04, 0.09, 0.15 };
+        ends = new[] { 1.0, 0.97, 0.92, 0.86 };
+        // Kepekatan warna puncak & kaki tiap lapis (lapis yang jauh lebih tipis)
+        topA = new byte[] { 190, 225, 225, 225 };
+        footA = new byte[] { 90, 120, 120, 120 };
         Root.Height = h; Root.ClipToBounds = true; Root.IsHitTestVisible = false;
-        paths = new Path[3];
-        for (int i = 0; i < 3; i++) {
+        paths = new Path[colors.Length];
+        for (int i = 0; i < paths.Length; i++) {
             // Gradasi satu warna per lapis: puncak bukit = warna lapisnya yang lebih terang, kakinya = warna itu
             // sendiri yang memudar ke arah bar (gradasi antar dua warna berbeda menghasilkan warna keruh)
             var c = colors[i];
-            var hi = Color.FromArgb(225, (byte)(c.R + (255 - c.R) * 0.4), (byte)(c.G + (255 - c.G) * 0.4), (byte)(c.B + (255 - c.B) * 0.4));
+            var hi = Color.FromArgb(topA[i], (byte)(c.R + (255 - c.R) * 0.4), (byte)(c.G + (255 - c.G) * 0.4), (byte)(c.B + (255 - c.B) * 0.4));
             var fill = new LinearGradientBrush();
             fill.MappingMode = BrushMappingMode.Absolute;
             fill.StartPoint = new Point(0, baseY - amps[i]); fill.EndPoint = new Point(0, baseY);
             fill.GradientStops.Add(new GradientStop(hi, 0));
-            fill.GradientStops.Add(new GradientStop(Color.FromArgb(120, c.R, c.G, c.B), 1));
+            fill.GradientStops.Add(new GradientStop(Color.FromArgb(footA[i], c.R, c.G, c.B), 1));
             fill.Freeze();
             paths[i] = new Path { Fill = fill };
             Root.Children.Add(paths[i]);
@@ -360,32 +373,27 @@ public class IslandWave {
         if (Playing) { t = now; frozenT = -1; if (lastDraw >= 0 && now - lastDraw < FrameTime) return; }
         else { if (frozenT < 0) frozenT = now; t = frozenT; if (X == lastX && lastDraw >= 0) return; }
         lastDraw = now; lastX = X;
-        // Lereng naik di awal bar dan turun menjelang titik sama panjang (bentuk simetris, tidak miring)
-        double tap = Math.Max(1, Math.Min(taper, X * 0.4)), fin = tap;
         // Tinggi gelombang dibatasi panjang bar (maks ~11% panjangnya): bar pendek di awal lagu dapat
         // gelombang rendah, jadi tidak membentuk gundukan/segitiga bersisi curam
         double grow = Math.Min(1.0, X * 0.11 / Math.Max(1, amps[0]));
-        // Garis luar = gabungan ketiga bukit, dengan sudut di persilangannya dibulatkan (smooth max), lalu ketiga
-        // lapis digambar bersarang di dalamnya (100% / 70% / 45%): tidak ada tepi yang bersilangan atau bersudut
-        int n = (int)Math.Ceiling(X);
-        if (prof.Length < n + 1) prof = new double[n + 64];
-        double a0 = grow * amps[0] * (0.72 + 0.28 * Math.Sin(t * breathW[0] + breathP[0]));
-        double a1 = grow * amps[1] * (0.72 + 0.28 * Math.Sin(t * breathW[1] + breathP[1]));
-        double a2 = grow * amps[2] * (0.72 + 0.28 * Math.Sin(t * breathW[2] + breathP[2]));
-        double k = Math.Max(0.5, 0.4 * a0);
-        for (int j = 0; j <= n; j++) {
-            double x = Math.Min(j, X);
-            double env = Smooth(x / fin) * Smooth((X - x) / tap);
-            // Lembah tidak sampai ke bar (minimal 30% tinggi), jadi tidak ada celah kosong di antara bukit
-            double h0 = a0 * (0.3 + 0.7 * Wave(x, t, 0)), h1 = a1 * (0.3 + 0.7 * Wave(x, t, 1)), h2 = a2 * (0.3 + 0.7 * Wave(x, t, 2));
-            prof[j] = env * SMax(SMax(h0, h1, k), h2, k);
-        }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < paths.Length; i++) {
+            double x0 = X * starts[i], x1 = X * ends[i], span = x1 - x0;
             var g = new StreamGeometry();
             using (var ctx = g.Open()) {
-                ctx.BeginFigure(new Point(0, h), true, true);
-                for (int j = 0; j <= n; j++) ctx.LineTo(new Point(Math.Min(j, X), baseY - prof[j] * nest[i]), true, true);
-                ctx.LineTo(new Point(X, h), true, false);
+                ctx.BeginFigure(new Point(x0, h), true, true);
+                ctx.LineTo(new Point(x0, baseY), true, true);
+                if (span > 2) {
+                    // Lereng naik dan turun sama panjang (bentuk simetris, tidak miring)
+                    double tap = Math.Max(1, Math.Min(taper, span * 0.4));
+                    double a = grow * amps[i] * (0.72 + 0.28 * Math.Sin(t * breathW[i] + breathP[i]));
+                    for (int j = (int)Math.Ceiling(x0); j < x1; j++) {
+                        double env = Smooth((j - x0) / tap) * Smooth((x1 - j) / tap);
+                        // Lembah tidak sampai ke bar (minimal 30% tinggi): tiap lapis seperti permukaan air yang bergelombang
+                        ctx.LineTo(new Point(j, baseY - a * env * (0.3 + 0.7 * Wave(j, t, i))), true, true);
+                    }
+                }
+                ctx.LineTo(new Point(x1, baseY), true, true);
+                ctx.LineTo(new Point(x1, h), true, false);
             }
             g.Freeze();
             paths[i].Data = g;
@@ -2567,6 +2575,8 @@ function New-WaveStrip($w, $h, [switch]$Small) {
     # kalau cover cenderung satu warna, ambil hue tetangga warna utama (lebih hangat & lebih sejuk).
     $hue1 = [IslandFast]::Hue($c1.R, $c1.G, $c1.B)
     function Far($c) { if (-not $c) { return $false }; $d = [Math]::Abs([IslandFast]::Hue($c.R, $c.G, $c.B) - $hue1); if ($d -gt 180) { $d = 360 - $d }; $d -ge 28 }
+    # Lapis paling belakang: warna utama yang pucat, seperti gelombang di kejauhan
+    $l0 = [IslandFast]::ShiftHue($c1, 6, 0.5, 1.3)
     $l1 = [IslandFast]::ShiftHue($c1, -8, 0.85, 1.15)
     $l2 = if (Far $m.Accent2) { $m.Accent2 } else { [IslandFast]::ShiftHue($c1, 32, 1.0, 1.1) }
     $l3 = if ((Far $m.Accent3) -and $m.Accent3 -ne $l2) { $m.Accent3 } else { [IslandFast]::ShiftHue($c1, -34, 1.0, 1.1) }
@@ -2586,7 +2596,7 @@ function New-WaveStrip($w, $h, [switch]$Small) {
     [void]$root.Children.Add($track)
 
     $kt = New-Object System.Windows.Media.TranslateTransform
-    $wave = New-Object IslandWave($h, $baseY, $(if ($Small) { 0.42 } else { 1.0 }), $(if ($Small) { 1.0 } else { 1.15 }), [System.Windows.Media.Color[]]@($l1, $l2, $l3), $kt, ($knobS / 2))
+    $wave = New-Object IslandWave($h, $baseY, $(if ($Small) { 0.42 } else { 1.0 }), $(if ($Small) { 1.0 } else { 1.15 }), [System.Windows.Media.Color[]]@($l0, $l1, $l2, $l3), $kt, ($knobS / 2))
     $wave.Playing = [bool]$m.Playing
     [void]$root.Children.Add($wave.Root)
 
