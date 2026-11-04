@@ -25,7 +25,9 @@ and what's playing, instead of the toasts in the bottom-right corner.
   Language & region > Add a language). Songs that only have plain lyrics show them line by line at an
   estimated pace. Lyrics you've already played are kept on your PC, so they load instantly next time.
   The little music icon next to the cover comes in several styles: bars, wave, spectrum, bouncing dots
-  or a spinning vinyl record, or a different one for each song.
+  or a spinning vinyl record, or a different one for each song. The mini island fades away when the
+  mouse comes near, so the tabs and buttons under it stay visible and clickable; the pop-up for a new
+  song does too (you can turn that off).
 - **Full lyrics page**: swipe to the third page of the list to see all the lyrics scrolling along with
   the song. Click a line to jump to it. Pin it to keep the island open, and turn furigana / romaji on or
   off for Japanese lyrics.
@@ -39,7 +41,8 @@ and what's playing, instead of the toasts in the bottom-right corner.
   it while music plays. Pause or stop it from the notification list.
 - **Updates**: a new version shows up once as a pop-up, then stays in the notification list with a short
   list of what changed. Click it to install: the island downloads the new version, keeps your settings
-  and saved lyrics, and restarts itself.
+  and saved lyrics, and restarts itself. Afterwards it shows once what's new in that version (see it
+  again with right-click > What's new in this version).
 - **English or Indonesian** interface, and a choice of monitor if you have more than one.
 - Stays on top of other windows, but steps aside for fullscreen games and videos.
 - Smooth: animations run at your screen's refresh rate.
@@ -73,10 +76,10 @@ Double-click **`Uninstall.cmd`** (in the downloaded folder or in `%LOCALAPPDATA%
 - Music volume: the player app only (default), or turn it off to have the music card change Windows' volume
 - Timer (1-60 minutes) and stopwatch
 - Show: volume & brightness changes, charging & low battery, microphone / camera dots, Bluetooth
-  headset, album color glow
+  headset, album color glow, and whether the song pop-up fades when the mouse is near
 - Music icon: bars, wave, spectrum, dots, vinyl record, or shuffle per song (the menu stays open so you
   can try each one)
-- Monitor, language, check for updates, restart, quit
+- Monitor, language, check for updates, what's new in this version, restart, quit
 
 **Lyric timing for one song**: scroll on the lyrics button of the music card. It is remembered for
 that song.

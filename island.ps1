@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.5'
+$APP_VERSION = '1.3.6'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -19,11 +19,15 @@ $settingsFile = Join-Path $here 'settings.json'
 # Monitor: nama perangkat layar (kosong = layar utama). Language: 'id' / 'en'.
 # AppVolume: slider volume kartu musik mengatur volume aplikasi pemutarnya saja, bukan volume utama Windows.
 # EqStyle: gaya ikon musik di samping cover (bars, wave, spectrum, dots, disc; random = berganti tiap lagu).
+# PopupFade: pop-up lagu baru memudar seperti mini island selama kursor di dekatnya (mati: tetap tampil & bisa diklik).
+# LastVersion: versi island saat terakhir jalan (catatan perubahan tampil sekali setelah diperbarui).
 $script:settings = [PSCustomObject]@{
     Lyrics = $true; Romaji = $true; Furigana = $true; LyricDelay = 0.15; Language = ''; Monitor = ''
     VolumeOsd = $true; Charging = $true; MicCam = $true; Headset = $true; Glow = $true; CheckUpdates = $true; SkipVersion = ''; NotifiedVersion = ''
-    AppVolume = $true; EqStyle = 'bars'
+    AppVolume = $true; EqStyle = 'bars'; PopupFade = $true; LastVersion = ''
 }
+# Belum ada settings.json = pemasangan baru (tidak perlu catatan perubahan)
+$script:hadSettings = Test-Path $settingsFile
 try {
     if (Test-Path $settingsFile) {
         $j = Get-Content $settingsFile -Raw | ConvertFrom-Json
@@ -2714,16 +2718,43 @@ function Show-Media([switch]$Refresh) {
     $script:mediaViewKey = $script:media.Key
     $h, $r = Get-MediaPopupSize $content
     Resize-Island $WIDE_W $h $r
-    Set-IslandVisible $true
+    # Seperti mini island: selama kursor di dekatnya pop-up memudar habis, supaya tab / tombol aplikasi di
+    # bawahnya tetap terlihat dan bisa diklik (notifikasi chat tidak). Kursor sudah di dekat saat lagu berganti:
+    # pop-up langsung mulai pudar. Lihat popupFadeTimer.
+    $script:popupFaded = $script:settings.PopupFade -and (Test-CursorNearIsland $WIDE_W $h)
+    Show-IslandOrFaded $script:popupFaded
+    $popupFadeTimer.Start()
     if ($Refresh) { Show-View 'MediaView' } else { Show-View 'MediaView' -Replay }
-    if ($Refresh -and $script:hovering) { return }
+    if ($Refresh -and $script:hovering -and -not $script:popupFaded) { return }
     $dismissTimer.Stop()
     $dismissTimer.Interval = Ms 4000
-    if (-not $script:hovering) { $dismissTimer.Start() }
+    if (-not $script:hovering -or $script:popupFaded) { $dismissTimer.Start() }
 }
+
+# Pop-up lagu memudar habis selama kursor di dekatnya dan tampil lagi saat kursor menjauh (selama pop-up masih
+# ada), kalau opsi PopupFade menyala. Selama pudar pop-up tidak ditahan kursor: tetap menutup sendiri. Untuk
+# membuka daftar: garis penanda di atas.
+$script:popupFaded = $false
+$popupFadeTimer = New-Object System.Windows.Threading.DispatcherTimer
+$popupFadeTimer.Interval = Ms 120
+$popupFadeTimer.Add_Tick({
+    if ($script:mode -ne 'media') { $popupFadeTimer.Stop(); $script:popupFaded = $false; return }
+    # Slider/gelombang sedang digeser atau menu terbuka: dibiarkan
+    if ([System.Windows.Input.Mouse]::Captured -or $menu.IsOpen) { return }
+    # Opsi dimatikan selagi pop-up pudar: pop-up langsung tampil lagi
+    $near = $script:settings.PopupFade -and (Test-CursorNearIsland)
+    if ($near -eq $script:popupFaded) { return }
+    $script:popupFaded = $near
+    $op = [System.Windows.UIElement]::OpacityProperty
+    if ($near) {
+        Animate $island $op 0 160
+        if (-not $dismissTimer.IsEnabled) { $dismissTimer.Interval = Ms 2000; $dismissTimer.Start() }
+    } else { Animate $island $op 1 300 }
+})
 
 function Open-Notif($n) {
     if ($n.Kind -eq 'update') { Start-SelfUpdate; return }
+    if ($n.Kind -eq 'whatsnew') { [void](Remove-IslandItem $n.Id); return }
     # Kedipan taskbar (WeChat) bukan notifikasi Windows: buka exe-nya kalau diketahui, tidak ada yang dihapus
     if ($n.Flash) { if ($n.Exe) { try { Start-Process $n.Exe } catch { Log "open exe: $_" } } }
     else {
@@ -2829,7 +2860,8 @@ function Show-Mini {
     $script:miniOn = $true
     $script:miniVisible = $true
     $script:miniKey = Get-MiniKey
-    $script:miniFaded = $false
+    # Kursor sudah di dekat island (mis. pop-up lagu yang tadi pudar baru menutup): langsung mulai pudar
+    $script:miniFaded = Test-CursorNearIsland ([Math]::Max([double]$script:miniW, $MINI_W)) ([Math]::Max([double]$script:miniH, $MINI_H))
     $music = $script:miniKey -ne 'clock'
     $mv = $views['MiniView']
     # Kembali ke mini island dengan lagu yang sama: isi yang masih ada dipakai lagi
@@ -2839,7 +2871,7 @@ function Show-Mini {
         Set-Theme $script:media.Accent
         Show-View 'MiniView'
         $views['MiniView'].IsHitTestVisible = $false
-        Set-IslandVisible $true
+        Show-IslandOrFaded $script:miniFaded
         $island.IsHitTestVisible = $false
         if (-not $script:overHot) { Animate $handle ([System.Windows.UIElement]::OpacityProperty) 0 200 }
         # Ukuran terakhir mini island (baris lirik / judul berjalan); baris lirik yang sudah lewat diganti oleh Update-MiniLyric
@@ -2878,7 +2910,7 @@ function Show-Mini {
     }
     Show-View 'MiniView'
     $views['MiniView'].IsHitTestVisible = $false
-    Set-IslandVisible $true
+    Show-IslandOrFaded $script:miniFaded
     # Mini island tidak menangkap klik; daftar tetap dibuka lewat garis penanda di atasnya
     $island.IsHitTestVisible = $false
     if (-not $script:overHot) { Animate $handle ([System.Windows.UIElement]::OpacityProperty) 0 200 }
@@ -2956,21 +2988,32 @@ function New-MiniMarquee {
 
 # Kursor mendekati mini island: island memudar habis. Piksel yang benar-benar transparan
 # tembus klik, jadi tab/tombol aplikasi di bawahnya tetap bisa diklik.
+# Kursor di atas island atau sedikit di samping/bawahnya. Gelembung timer di kanan island ikut dihitung, dan
+# jaraknya ikut cahaya warna album di sekeliling island (bagian itu juga menghalangi klik). $w/$h: ukuran island
+# yang dipakai (bawaan ukuran sekarang; island yang baru akan membesar memakai ukuran akhirnya). Island selalu
+# di tengah, jadi posisinya dihitung dari garis tengah island.
+function Test-CursorNearIsland($w = $island.ActualWidth, $h = $island.ActualHeight) {
+    try {
+        $p = [IslandNative]::CursorPos()
+        $q = $island.PointFromScreen((New-Object System.Windows.Point($p[0], $p[1])))
+        $dx = $q.X - $island.ActualWidth / 2
+        $right = $w / 2 + $bubble.ActualWidth + $bubble.Margin.Left
+        return ($dx -ge (-$w / 2 - 22) -and $dx -le ($right + 22) -and $q.Y -ge -1 -and $q.Y -le ($h + 20))
+    } catch { return $false }
+}
+# Island tampil, atau tetap pudar kalau kursor sedang di dekatnya (tidak muncul sebentar lalu memudar)
+function Show-IslandOrFaded($faded) {
+    if ($faded) { $island.IsHitTestVisible = $true; Animate $island ([System.Windows.UIElement]::OpacityProperty) 0 160 }
+    else { Set-IslandVisible $true }
+}
+
 $miniTimer = New-Object System.Windows.Threading.DispatcherTimer
 $miniTimer.Interval = Ms 120
 $miniTimer.Add_Tick({
     if ($script:mode -ne 'idle' -or -not $script:miniOn) { $miniTimer.Stop(); return }
     # Sedang tersembunyi (tidak ada lirik): tidak ada yang perlu dipudarkan
     if (-not $script:miniVisible) { $script:miniFaded = $false; return }
-    $near = $false
-    try {
-        $p = [IslandNative]::CursorPos()
-        $q = $island.PointFromScreen((New-Object System.Windows.Point($p[0], $p[1])))
-        # Gelembung timer di kanan island ikut dihitung
-        $right = $island.ActualWidth + $bubble.ActualWidth + $bubble.Margin.Left
-        # Jarak ikut cahaya warna album di sekeliling island (bagian itu juga menghalangi klik)
-        $near = $q.X -ge -22 -and $q.X -le ($right + 22) -and $q.Y -ge -1 -and $q.Y -le ($island.ActualHeight + 20)
-    } catch {}
+    $near = Test-CursorNearIsland
     if ($near -ne $script:miniFaded) {
         $script:miniFaded = $near
         if ($near) { Animate $island ([System.Windows.UIElement]::OpacityProperty) 0 160 }
@@ -5442,7 +5485,7 @@ function Show-UpdateAvailable($latest, $notes = @(), [switch]$Popup) {
         Title = (T "Update tersedia: v$latest" "Update available: v$latest"); Body = $body
         Time = (Get-Date); Icon = $script:islandLogo; Photo = $null; Accent = (Rgb 10 132 255)
     }
-    $script:islandItems = @($item)
+    $script:islandItems = @(@($script:islandItems | Where-Object { $_.Kind -ne 'update' }) + $item)
     Merge-Recent
     if ($Popup) {
         $script:settings.NotifiedVersion = $latest; Save-Settings
@@ -5466,6 +5509,87 @@ function Remove-IslandItem($id) {
     Merge-Recent
     $true
 }
+
+# ---------- Catatan perubahan ----------
+# Tampil sekali setelah island diperbarui (pop-up, lalu tetap di daftar notifikasi sampai dihapus), dan lewat
+# menu "Yang baru di versi ini". Terbaru dulu; tiap versi berisi poin singkat dalam dua bahasa.
+$CHANGELOG = @(
+    @{ V = '1.3.6'
+        Id = @('Pop-up lagu baru ikut transparan saat kursor mendekat, seperti mini island',
+            'Bisa dimatikan: klik kanan > Tampilkan > Pop-up lagu memudar saat kursor mendekat',
+            'Garis tipis di atas island juga membuka daftar saat pop-up lagu tampil',
+            'Catatan seperti ini muncul setelah tiap update (klik kanan > Yang baru di versi ini)')
+        En = @('The new-song pop-up turns see-through when the mouse is near, like the mini island',
+            'Turn it off: right-click > Show > Song pop-up fades when the mouse is near',
+            'The thin line above the island also opens the list while a song pop-up shows',
+            "A note like this appears after each update (right-click > What's new in this version)") }
+    @{ V = '1.3.5'
+        Id = @('Gelombang progress lebih alami: 4 lapis yang masing-masing bergerak sendiri')
+        En = @('More natural progress wave: four uneven layers that each move on their own') }
+    @{ V = '1.3.4'
+        Id = @('Animasi lebih mulus, mengikuti refresh rate layar', 'Tidak ada lagi jeda acak saat memori dibersihkan',
+            'Ganti baris lirik tidak tersendat lagi', 'Furigana/romaji di halaman lirik mengikuti baris yang sedang dinyanyikan',
+            '5 gaya ikon musik (klik kanan > Ikon musik)')
+        En = @("Smoother animations at your screen's refresh rate", 'No more random freezes while memory is cleaned up',
+            'Lyric line changes no longer stutter', 'Furigana/romaji on the lyrics page follow the line being sung',
+            '5 music icon styles (right-click > Music icon)') }
+    @{ V = '1.3.3'
+        Id = @('Geser ke halaman lirik tidak tersendat lagi', 'Furigana/romaji nyala-mati dengan halus', 'Gelombang progress mengalir lebih cepat')
+        En = @('Swiping to the lyrics page no longer freezes', 'Furigana/romaji turn on and off smoothly', 'Faster flowing progress wave') }
+    @{ V = '1.3.2'
+        Id = @('Memori jauh lebih kecil: sekitar 45 MB saat diam (sebelumnya 130 MB)')
+        En = @('Uses much less memory: about 45 MB when idle instead of 130 MB') }
+    @{ V = '1.3.1'
+        Id = @('Volume di kartu musik mengatur aplikasi pemutarnya saja', 'Judul & artis yang panjang berjalan pelan',
+            'Pergantian lagu memudar halus, dan CPU lebih ringan')
+        En = @("The music card's volume controls the playing app only", 'Long titles and artist names scroll',
+            'Songs change with a smooth crossfade, and lighter on CPU') }
+    @{ V = '1.3.0'
+        Id = @('Lirik untuk Apple Music & YouTube, thumbnail YouTube, video yang dibisukan tidak mengambil alih')
+        En = @('Lyrics for Apple Music & YouTube, YouTube thumbnails, and muted videos no longer take over') }
+)
+$WHATSNEW_ID = [uint32]4100000001
+# Item "Yang baru": perubahan versi ini, atau semua versi setelah $since (update yang melompati beberapa versi)
+function Show-WhatsNew($since = $null, [switch]$Popup) {
+    $list = @($CHANGELOG | Where-Object { if ($since) { [version]$_.V -gt [version]$since -and [version]$_.V -le [version]$APP_VERSION } else { $_.V -eq $APP_VERSION } })
+    if (-not $list.Count) { return }
+    $dot = '  ' + [char]0x00B7 + '  '
+    $parts = foreach ($e in $list) {
+        $txt = $(if ($script:settings.Language -eq 'en') { $e.En } else { $e.Id }) -join $dot
+        if ($list.Count -gt 1) { "v$($e.V): $txt" } else { $txt }
+    }
+    if (-not $script:islandLogo) { $script:islandLogo = New-IslandLogo }
+    $item = [PSCustomObject]@{
+        Id = $WHATSNEW_ID; App = 'Mini Island'; Aumid = ''; Kind = 'whatsnew'; Version = $APP_VERSION
+        Title = (T "Yang baru di v$APP_VERSION" "What's new in v$APP_VERSION"); Body = ($parts -join $dot)
+        Time = (Get-Date); Icon = $script:islandLogo; Photo = $null; Accent = (Rgb 10 132 255)
+    }
+    $script:islandItems = @(@($script:islandItems | Where-Object { $_.Kind -ne 'whatsnew' }) + $item)
+    Merge-Recent
+    if ($Popup) {
+        Enqueue-Notif $item
+        if ($script:mode -eq 'idle') { Process-Queue }
+    }
+    if ($script:mode -eq 'list') { Show-List -Refresh }
+}
+# Saat mulai: versinya beda dari terakhir kali jalan (baru diperbarui) -> catatan perubahannya tampil sekali.
+# Pemasangan baru atau turun versi tidak perlu.
+function Check-WhatsNew {
+    $last = $script:settings.LastVersion
+    if ($last -eq $APP_VERSION) { return }
+    $script:settings.LastVersion = $APP_VERSION; Save-Settings
+    if (-not $script:hadSettings) { return }
+    $since = $null
+    if ($last) {
+        try { if ([version]$last -ge [version]$APP_VERSION) { return } } catch {}
+        $since = $last
+    }
+    Show-WhatsNew $since -Popup
+}
+# Ditunda sebentar setelah island mulai, supaya tidak berebut dengan pembacaan notifikasi & lagu pertama
+$whatsNewTimer = New-Object System.Windows.Threading.DispatcherTimer
+$whatsNewTimer.Interval = [TimeSpan]::FromSeconds(4)
+$whatsNewTimer.Add_Tick({ $whatsNewTimer.Stop(); try { Check-WhatsNew } catch { Log "whats new: $_" } })
 
 # ---------- Update sekali klik ----------
 # Unduh ZIP repo, cek isinya (versi terbaca, skrip bisa di-parse), salin file aplikasi ke folder island
@@ -5725,6 +5849,7 @@ function Build-Menu {
     [void](Add-MI $sm (New-MI (T 'Mikrofon / kamera sedang dipakai' 'Microphone / camera in use') 'MicCam' $onToggle -Check -Checked $script:settings.MicCam))
     [void](Add-MI $sm (New-MI (T 'Headset Bluetooth tersambung' 'Bluetooth headset connected') 'Headset' $onToggle -Check -Checked $script:settings.Headset))
     [void](Add-MI $sm (New-MI (T 'Cahaya warna album' 'Album color glow') 'Glow' $onToggle -Check -Checked $script:settings.Glow))
+    [void](Add-MI $sm (New-MI (T 'Pop-up lagu memudar saat kursor mendekat' 'Song pop-up fades when the mouse is near') 'PopupFade' $onToggle -Check -Checked $script:settings.PopupFade))
     $em = Add-MI $menu (New-MI (T 'Ikon musik' 'Music icon'))
     $pickEq = {
         param($s, $e)
@@ -5768,6 +5893,7 @@ function Build-Menu {
     [void](Add-MI $lm (New-MI 'Bahasa Indonesia' 'id' $pickLang -Check -Checked ($script:settings.Language -eq 'id')))
     Add-Sep $menu
     [void](Add-MI $menu (New-MI (T 'Cek update' 'Check for updates') $null { Start-UpdateCheck -Manual }))
+    [void](Add-MI $menu (New-MI (T 'Yang baru di versi ini' "What's new in this version") $null { Show-WhatsNew -Popup }))
     [void](Add-MI $menu (New-MI (T 'Muat ulang Island' 'Restart Island') $null { $script:restartCode = 3; Exit-Island }))
     [void](Add-MI $menu (New-MI (T 'Keluar dari Island' 'Quit Island') $null { Exit-Island }))
 }
@@ -5859,7 +5985,8 @@ $hoverTimer = New-Object System.Windows.Threading.DispatcherTimer
 $hoverTimer.Interval = Ms 300
 $hoverTimer.Add_Tick({
     $hoverTimer.Stop()
-    if ($script:overHot -and $script:mode -eq 'idle') {
+    if ($script:overHot -and ($script:mode -eq 'idle' -or $script:mode -eq 'media')) {
+        $dismissTimer.Stop()
         try { Show-List } catch { Log "show-list: $_ | $($_.ScriptStackTrace -replace '\s+', ' ')" }
     }
 })
@@ -5879,7 +6006,7 @@ $hotZone.Add_MouseEnter({
     Animate $handle ([System.Windows.FrameworkElement]::WidthProperty) 64 200
     Animate $handle ([System.Windows.UIElement]::OpacityProperty) 1 200
     $closeTimer.Stop()
-    if ($script:mode -eq 'idle') { $hoverTimer.Start() }
+    if ($script:mode -eq 'idle' -or $script:mode -eq 'media') { $hoverTimer.Start() }
 })
 $hotZone.Add_MouseLeave({
     $script:overHot = $false
@@ -5997,7 +6124,7 @@ $island.Add_MouseEnter({
     $hoverWatch.Start()
     $closeTimer.Stop()
     if ($script:mode -eq 'notif') { $dismissTimer.Stop(); Set-NotifExpanded $true }
-    elseif ($script:mode -eq 'media') { $dismissTimer.Stop() }
+    elseif ($script:mode -eq 'media' -and -not $script:popupFaded) { $dismissTimer.Stop() }
     elseif ($script:mode -eq 'activity') { $activityTimer.Stop() }
 })
 $island.Add_MouseLeave({ On-IslandLeave })
@@ -6423,6 +6550,8 @@ $window.Add_Loaded({
     try { Check-Sensors } catch { Log "sensors: $_" }
     if ($script:settings.CheckUpdates) { Start-UpdateCheck }
     $pollTimer.Start()
+    # Baru diperbarui: catatan perubahannya tampil sebentar lagi
+    $whatsNewTimer.Start()
     # Sisa kompilasi kode C# dan pembuatan jendela saat mulai dibersihkan sekali
     $memTimer.Start()
 })
