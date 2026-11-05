@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.6'
+$APP_VERSION = '1.3.7'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -232,6 +232,33 @@ public static class IslandSensors {
     }
 }
 '@
+# Crash yang tidak bisa ditangani island (mis. AccessViolation di dalam penggambar teks WPF): detailnya dicatat
+# di island.log, lalu island langsung berhenti. Tanpa ini island membeku ~10 detik selama Windows membuat
+# laporan crash sebelum launcher bisa menjalankannya lagi.
+Add-IslandType @'
+using System;
+using System.IO;
+using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
+using System.Security;
+public static class IslandCrash {
+    static string logPath;
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr h, uint code);
+    public static void Install(string log) {
+        logPath = log;
+        AppDomain.CurrentDomain.UnhandledException += OnCrash;
+    }
+    // Atribut ini perlu supaya error yang merusak keadaan proses (AccessViolation) juga sampai ke sini
+    [HandleProcessCorruptedStateExceptions, SecurityCritical]
+    static void OnCrash(object sender, UnhandledExceptionEventArgs e) {
+        try { File.AppendAllText(logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " crash: " + e.ExceptionObject + Environment.NewLine); } catch { }
+        // Kode keluar bukan 0: launcher menjalankan island lagi
+        TerminateProcess(GetCurrentProcess(), 1);
+    }
+}
+'@
+[IslandCrash]::Install($logFile)
 # Hitungan berat yang dulu ditulis di PowerShell (gelombang, warna cover) dibuat dalam C#: di PowerShell
 # keduanya memakan ~1 detik di thread UI saat ganti lagu, membuat semua animasi tersendat
 Add-IslandType -Refs $WPF_REFS @'
@@ -3397,6 +3424,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -3421,7 +3449,9 @@ public static class LyricReader {
     static readonly ConcurrentDictionary<string, LyricParts> done = new ConcurrentDictionary<string, LyricParts>();
     static readonly object gate = new object();
     static readonly List<string> queue = new List<string>();
-    static bool working;
+    static Thread worker;
+    // Pembaca Windows tidak dipanggil dari dua thread sekaligus (thread latar & thread UI saat baris belum siap)
+    static readonly object analyzerGate = new object();
     static string lastError;
 
     public static void Init(MethodInfo words, PropertyInfo text, PropertyInfo yomi, PropertyInfo phrase,
@@ -3449,8 +3479,9 @@ public static class LyricReader {
     }
 
     // Baris-baris berbahasa Jepang dihitung di thread latar: mulai baris ke-$from ke bawah, lalu sisanya ke
-    // atas. Antrean sebelumnya diganti, jadi lagu yang sedang diputar selalu didahulukan. Thread-nya STA:
-    // pembaca Windows gagal kalau dipanggil dari thread pool (MTA).
+    // atas. Antrean sebelumnya diganti, jadi lagu yang sedang diputar selalu didahulukan. Thread-nya STA
+    // (pembaca Windows gagal kalau dipanggil dari thread pool/MTA) dan tetap hidup menunggu antrean berikutnya,
+    // jadi objek WinRT pembacanya tidak berpindah-pindah apartemen.
     public static void Prepare(string[] texts, int from) {
         lock (gate) {
             queue.Clear();
@@ -3459,12 +3490,14 @@ public static class LyricReader {
             from = Math.Max(0, Math.Min(from, n));
             for (int i = from; i < n; i++) Enqueue(texts[i]);
             for (int i = from - 1; i >= 0; i--) Enqueue(texts[i]);
-            if (working || queue.Count == 0) return;
-            working = true;
+            if (queue.Count == 0) return;
+            if (worker == null || !worker.IsAlive) {
+                worker = new Thread(Work) { IsBackground = true, Name = "LyricReader" };
+                worker.SetApartmentState(ApartmentState.STA);
+                worker.Start();
+            }
+            Monitor.Pulse(gate);
         }
-        var th = new Thread(Work) { IsBackground = true, Name = "LyricReader" };
-        th.SetApartmentState(ApartmentState.STA);
-        th.Start();
     }
     static void Enqueue(string t) {
         if (!string.IsNullOrEmpty(t) && japanese.IsMatch(t) && !done.ContainsKey(t) && !queue.Contains(t)) queue.Add(t);
@@ -3473,7 +3506,7 @@ public static class LyricReader {
         while (true) {
             string t;
             lock (gate) {
-                if (queue.Count == 0) { working = false; return; }
+                while (queue.Count == 0) Monitor.Wait(gate);
                 t = queue[0]; queue.RemoveAt(0);
             }
             if (done.ContainsKey(t)) continue;
@@ -3530,10 +3563,14 @@ public static class LyricReader {
         if (getWords != null && japanese.IsMatch(text)) {
             try {
                 var ds = new List<string>(); var ys = new List<string>(); var ph = new List<bool>();
-                var words = getWords.Invoke(null, new object[] { text, false }) as IEnumerable;
-                if (words != null) {
-                    foreach (object w in words) {
-                        ds.Add((string)pText.GetValue(w, null) ?? ""); ys.Add((string)pYomi.GetValue(w, null)); ph.Add((bool)pPhrase.GetValue(w, null));
+                lock (analyzerGate) {
+                    var words = getWords.Invoke(null, new object[] { text, false }) as IEnumerable;
+                    if (words != null) {
+                        foreach (object w in words) {
+                            ds.Add((string)pText.GetValue(w, null) ?? ""); ys.Add((string)pYomi.GetValue(w, null)); ph.Add((bool)pPhrase.GetValue(w, null));
+                            if (Marshal.IsComObject(w)) Marshal.ReleaseComObject(w);
+                        }
+                        if (Marshal.IsComObject(words)) Marshal.ReleaseComObject(words);
                     }
                 }
                 // Pembaca Windows mengubah huruf Latin/spasi jadi lebar penuh. Kalau panjang totalnya sama,
@@ -5514,6 +5551,11 @@ function Remove-IslandItem($id) {
 # Tampil sekali setelah island diperbarui (pop-up, lalu tetap di daftar notifikasi sampai dihapus), dan lewat
 # menu "Yang baru di versi ini". Terbaru dulu; tiap versi berisi poin singkat dalam dua bahasa.
 $CHANGELOG = @(
+    @{ V = '1.3.7'
+        Id = @('Kalau island sempat crash, sekarang langsung pulih dalam beberapa detik (tidak membeku dulu), dan penyebabnya dicatat di island.log',
+            'Pembaca furigana lebih stabil')
+        En = @('If the island ever crashes, it now comes back within seconds (no freeze first), and the cause is written to island.log',
+            'Steadier furigana reader') }
     @{ V = '1.3.6'
         Id = @('Pop-up lagu baru ikut transparan saat kursor mendekat, seperti mini island',
             'Bisa dimatikan: klik kanan > Tampilkan > Pop-up lagu memudar saat kursor mendekat',
