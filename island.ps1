@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.7'
+$APP_VERSION = '1.3.8'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -234,17 +234,28 @@ public static class IslandSensors {
 '@
 # Crash yang tidak bisa ditangani island (mis. AccessViolation di dalam penggambar teks WPF): detailnya dicatat
 # di island.log, lalu island langsung berhenti. Tanpa ini island membeku ~10 detik selama Windows membuat
-# laporan crash sebelum launcher bisa menjalankannya lagi.
+# laporan crash sebelum launcher bisa menjalankannya lagi. Selain error-nya dicatat juga alamat yang gagal,
+# urutan pemanggilan native (modul+offset) dan modul non-Windows yang termuat, supaya penyebabnya bisa
+# dilacak tanpa dump. IslandWait: menunggu task tanpa memproses pesan Windows. IslandText: penyaring teks.
 Add-IslandType @'
 using System;
+using System.Globalization;
 using System.IO;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
 public static class IslandCrash {
     static string logPath;
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr h, uint code);
+    [DllImport("kernel32.dll")] static extern IntPtr RtlLookupFunctionEntry(ulong pc, out ulong imageBase, IntPtr history);
+    [DllImport("kernel32.dll")] static extern IntPtr RtlVirtualUnwind(uint handlerType, ulong imageBase, ulong pc, IntPtr functionEntry,
+        IntPtr context, out IntPtr handlerData, out ulong establisherFrame, IntPtr contextPointers);
+    [DllImport("kernel32.dll")] static extern bool GetModuleHandleExW(uint flags, IntPtr address, out IntPtr module);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern uint GetModuleFileNameW(IntPtr module, StringBuilder name, uint size);
     public static void Install(string log) {
         logPath = log;
         AppDomain.CurrentDomain.UnhandledException += OnCrash;
@@ -252,9 +263,168 @@ public static class IslandCrash {
     // Atribut ini perlu supaya error yang merusak keadaan proses (AccessViolation) juga sampai ke sini
     [HandleProcessCorruptedStateExceptions, SecurityCritical]
     static void OnCrash(object sender, UnhandledExceptionEventArgs e) {
-        try { File.AppendAllText(logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " crash: " + e.ExceptionObject + Environment.NewLine); } catch { }
+        try {
+            // Error-nya dulu: kalau mengumpulkan detail native ikut gagal, ini sudah tercatat
+            Write(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " crash: " + e.ExceptionObject);
+            Write("  native: " + NativeDetails());
+        } catch { }
         // Kode keluar bukan 0: launcher menjalankan island lagi
-        TerminateProcess(GetCurrentProcess(), 1);
+        finally { TerminateProcess(GetCurrentProcess(), 1); }
+    }
+    static void Write(string s) { try { File.AppendAllText(logPath, s + Environment.NewLine); } catch { } }
+    [HandleProcessCorruptedStateExceptions, SecurityCritical]
+    static string NativeDetails() {
+        var sb = new StringBuilder();
+        IntPtr ctx = IntPtr.Zero;
+        try {
+            // EXCEPTION_POINTERS: record @0, CONTEXT @8. EXCEPTION_RECORD (x64): kode @0, alamat @16, jumlah
+            // parameter @24, parameter @32 (AV: baca/tulis, alamat)
+            IntPtr ep = Marshal.GetExceptionPointers();
+            IntPtr rec = ep == IntPtr.Zero ? IntPtr.Zero : Marshal.ReadIntPtr(ep);
+            if (ep != IntPtr.Zero) ctx = Marshal.ReadIntPtr(ep, 8);
+            if (rec == IntPtr.Zero) sb.Append("no exception record");
+            else {
+                uint code = (uint)Marshal.ReadInt32(rec);
+                sb.Append("code 0x").Append(code.ToString("X8")).Append(" at ").Append(Where(Marshal.ReadIntPtr(rec, 16)));
+                if ((code == 0xC0000005 || code == 0xC0000006) && Marshal.ReadInt32(rec, 24) >= 2) {
+                    long kind = Marshal.ReadIntPtr(rec, 32).ToInt64();
+                    sb.Append(kind == 0 ? " reading 0x" : kind == 1 ? " writing 0x" : kind == 8 ? " executing 0x" : " accessing 0x");
+                    sb.Append(Marshal.ReadIntPtr(rec, 40).ToInt64().ToString("X"));
+                }
+            }
+        } catch (Exception ex) { sb.Append("record failed: ").Append(ex.GetType().Name); }
+        if (ctx != IntPtr.Zero) {
+            try { sb.Append(" | stack:").Append(Stack(ctx)); }
+            catch (Exception ex) { sb.Append(" stack failed: ").Append(ex.GetType().Name); }
+        }
+        try {
+            // Modul dari luar folder Windows yang termuat (overlay, codec, alat lain yang menyusup ke proses)
+            string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            sb.Append(" | other modules:");
+            foreach (System.Diagnostics.ProcessModule m in System.Diagnostics.Process.GetCurrentProcess().Modules) {
+                string f = m.FileName ?? "";
+                if (!f.StartsWith(win, StringComparison.OrdinalIgnoreCase)) sb.Append(' ').Append(f);
+            }
+        } catch (Exception ex) { sb.Append(" modules failed: ").Append(ex.GetType().Name); }
+        return sb.ToString();
+    }
+    // Urutan pemanggilan di tempat error: CONTEXT milik error itu disalin, lalu dibuka frame demi frame lewat
+    // tabel unwind (termasuk kode .NET hasil JIT). Frame JIT berurutan diringkas jadi [n .NET].
+    [HandleProcessCorruptedStateExceptions, SecurityCritical]
+    static string Stack(IntPtr record) {
+        const int Size = 1232, RspAt = 0x98, RipAt = 0xF8;   // CONTEXT x64
+        IntPtr raw = Marshal.AllocHGlobal(Size + 16);
+        try {
+            IntPtr ctx = new IntPtr((raw.ToInt64() + 15) & ~15L);
+            var copy = new byte[Size];
+            Marshal.Copy(record, copy, 0, Size);
+            Marshal.Copy(copy, 0, ctx, Size);
+            var sb = new StringBuilder();
+            int jit = 0;
+            long lastSp = 0;
+            for (int i = 0; i < 64; i++) {
+                long pc = Marshal.ReadInt64(ctx, RipAt), sp = Marshal.ReadInt64(ctx, RspAt);
+                if (pc == 0 || sp <= lastSp) break;
+                lastSp = sp;
+                string w = Where(new IntPtr(pc));
+                if (w.StartsWith("0x")) jit++;
+                else {
+                    if (jit > 0) { sb.Append(" [").Append(jit).Append(" .NET]"); jit = 0; }
+                    sb.Append(' ').Append(w);
+                }
+                ulong imageBase;
+                IntPtr fn = RtlLookupFunctionEntry((ulong)pc, out imageBase, IntPtr.Zero);
+                if (fn == IntPtr.Zero) {
+                    // Fungsi daun: alamat kembali ada di [rsp]
+                    Marshal.WriteInt64(ctx, RipAt, Marshal.ReadInt64(new IntPtr(sp)));
+                    Marshal.WriteInt64(ctx, RspAt, sp + 8);
+                } else {
+                    IntPtr hd; ulong ef;
+                    RtlVirtualUnwind(0, imageBase, (ulong)pc, fn, ctx, out hd, out ef, IntPtr.Zero);
+                }
+            }
+            if (jit > 0) sb.Append(" [").Append(jit).Append(" .NET]");
+            return sb.ToString();
+        } finally { Marshal.FreeHGlobal(raw); }
+    }
+    // Alamat -> "modul+offset" (6 = dicari dari alamat, tanpa menambah hitungan referensi modul)
+    static string Where(IntPtr a) {
+        IntPtr mod;
+        if (a != IntPtr.Zero && GetModuleHandleExW(6, a, out mod) && mod != IntPtr.Zero) {
+            var name = new StringBuilder(260);
+            GetModuleFileNameW(mod, name, 260);
+            return Path.GetFileName(name.ToString()) + "+0x" + (a.ToInt64() - mod.ToInt64()).ToString("X");
+        }
+        return "0x" + a.ToInt64().ToString("X");
+    }
+}
+// Menunggu task selesai TANPA memproses pesan Windows. Task.Wait di thread UI (STA) ikut menjalankan pesan lain
+// selama menunggu, jadi kode island lain (timer, gambar ulang) bisa berjalan di tengah fungsi yang sedang
+// berjalan. HANYA untuk task .NET murni (mis. unduhan HttpClient), BUKAN operasi WinRT dari aplikasi lain:
+// sebagian objeknya terikat ke thread UI dan baru selesai kalau thread UI memproses pesan (thumbnail Spotify
+// jadi macet sampai batas waktu). true kalau selesai dalam batas waktu.
+public static class IslandWait {
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(SafeWaitHandle h, uint ms);
+    public static bool Done(Task t, int ms) {
+        if (t == null) return false;
+        if (!t.IsCompleted) WaitForSingleObject(((IAsyncResult)t).AsyncWaitHandle.SafeWaitHandle, (uint)Math.Max(0, ms));
+        return t.IsCompleted;
+    }
+}
+// Teks dari luar (judul lagu, notifikasi, lirik, nama perangkat) sebelum digambar. Penggambar teks WPF bisa
+// crash pada teks ekstrem (ratusan tanda diakritik bertumpuk / teks "zalgo", bug WPF yang belum diperbaiki),
+// jadi: karakter kontrol dibuang, surrogate tanpa pasangan jadi tanda pengganti, tanda gabung & karakter format
+// berturut-turut dibatasi 10 (cukup untuk bahasa apa pun), dan teks dipotong di max karakter (0 = tanpa batas).
+// Teks biasa dikembalikan apa adanya (objek yang sama).
+public static class IslandText {
+    const int MaxRun = 10;
+    public static string Safe(string s, int max) {
+        if (string.IsNullOrEmpty(s) || (Ok(s) && (max <= 0 || s.Length <= max))) return s;
+        var sb = new StringBuilder(max > 0 ? Math.Min(s.Length, max) : s.Length);
+        int run = 0;
+        for (int i = 0; i < s.Length; i++) {
+            char c = s[i];
+            bool pair = char.IsHighSurrogate(c) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]);
+            if (!pair) {
+                if (char.IsSurrogate(c)) c = (char)0xFFFD;
+                else if (IsControl(c)) continue;
+            }
+            UnicodeCategory cat = pair ? CharUnicodeInfo.GetUnicodeCategory(s, i) : CharUnicodeInfo.GetUnicodeCategory(c);
+            if (IsJoiner(cat)) { if (++run > MaxRun) { if (pair) i++; continue; } }
+            else run = 0;
+            if (max > 0 && sb.Length + (pair ? 2 : 1) > max) break;
+            sb.Append(c);
+            if (pair) { sb.Append(s[i + 1]); i++; }
+        }
+        return sb.ToString();
+    }
+    // Karakter kontrol C0/C1, kecuali baris baru & tab
+    static bool IsControl(char c) {
+        return c < (char)32 ? (c != (char)10 && c != (char)13 && c != (char)9) : (c >= (char)0x7F && c <= (char)0x9F);
+    }
+    static bool IsJoiner(UnicodeCategory cat) {
+        return cat == UnicodeCategory.NonSpacingMark || cat == UnicodeCategory.SpacingCombiningMark
+            || cat == UnicodeCategory.EnclosingMark || cat == UnicodeCategory.Format;
+    }
+    // Cek cepat: true kalau tidak ada yang perlu diubah
+    static bool Ok(string s) {
+        int run = 0;
+        for (int i = 0; i < s.Length; i++) {
+            char c = s[i];
+            if (c < (char)0x7F) {
+                if (c < (char)32 && IsControl(c)) return false;
+                run = 0; continue;
+            }
+            if (c <= (char)0x9F) return false;
+            UnicodeCategory cat;
+            if (char.IsSurrogate(c)) {
+                if (!(char.IsHighSurrogate(c) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))) return false;
+                cat = CharUnicodeInfo.GetUnicodeCategory(s, i); i++;
+            } else cat = CharUnicodeInfo.GetUnicodeCategory(c);
+            if (IsJoiner(cat)) { if (++run > MaxRun) return false; }
+            else run = 0;
+        }
+        return true;
     }
 }
 '@
@@ -454,24 +624,29 @@ public static class IslandShell {
 
     // Ikon (dengan transparansi) untuk "shell:AppsFolder\<AUMID>" atau path file
     public static BitmapSource Icon(string parsingName, int size) {
-        IShellItemImageFactory f;
-        SHCreateItemFromParsingName(parsingName, IntPtr.Zero, typeof(IShellItemImageFactory).GUID, out f);
-        IntPtr hb;
-        if (f.GetImage(new SIZE { cx = size, cy = size }, 0x4, out hb) != 0 || hb == IntPtr.Zero) return null;   // 0x4 = hanya ikon
+        IShellItemImageFactory f = null;
         try {
-            var bm = new BITMAP();
-            GetObject(hb, Marshal.SizeOf(typeof(BITMAP)), ref bm);
-            if (bm.bmBits == IntPtr.Zero || bm.bmBitsPixel != 32) return null;
-            int stride = bm.bmWidthBytes, h = Math.Abs(bm.bmHeight);
-            var px = new byte[stride * h];
-            Marshal.Copy(bm.bmBits, px, 0, px.Length);
-            // Bitmap DIB tersimpan dari baris bawah ke atas
-            var rows = new byte[px.Length];
-            for (int y = 0; y < h; y++) Buffer.BlockCopy(px, y * stride, rows, (h - 1 - y) * stride, stride);
-            var bs = BitmapSource.Create(bm.bmWidth, h, 96, 96, PixelFormats.Pbgra32, null, rows, stride);
-            bs.Freeze();
-            return bs;
-        } finally { DeleteObject(hb); }
+            SHCreateItemFromParsingName(parsingName, IntPtr.Zero, typeof(IShellItemImageFactory).GUID, out f);
+            IntPtr hb;
+            if (f.GetImage(new SIZE { cx = size, cy = size }, 0x4, out hb) != 0 || hb == IntPtr.Zero) return null;   // 0x4 = hanya ikon
+            try {
+                var bm = new BITMAP();
+                GetObject(hb, Marshal.SizeOf(typeof(BITMAP)), ref bm);
+                if (bm.bmBits == IntPtr.Zero || bm.bmBitsPixel != 32) return null;
+                int stride = bm.bmWidthBytes, h = Math.Abs(bm.bmHeight);
+                var px = new byte[stride * h];
+                Marshal.Copy(bm.bmBits, px, 0, px.Length);
+                // Bitmap DIB tersimpan dari baris bawah ke atas
+                var rows = new byte[px.Length];
+                for (int y = 0; y < h; y++) Buffer.BlockCopy(px, y * stride, rows, (h - 1 - y) * stride, stride);
+                var bs = BitmapSource.Create(bm.bmWidth, h, 96, 96, PixelFormats.Pbgra32, null, rows, stride);
+                bs.Freeze();
+                return bs;
+            } finally { DeleteObject(hb); }
+        } finally {
+            // Objek shell dilepas sekarang (kalau dibiarkan, finalizer harus menunggu thread UI untuk melepasnya)
+            if (f != null) Marshal.ReleaseComObject(f);
+        }
     }
 }
 public static class IslandWpn {
@@ -489,21 +664,24 @@ public static class IslandWpn {
     // Database dibuka hanya-baca.
     public static string Payload(long id) {
         string path = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + @"\Microsoft\Windows\Notifications\wpndatabase.db";
-        IntPtr db, st;
-        if (sqlite3_open_v2(Z(path), out db, 1, IntPtr.Zero) != 0) { sqlite3_close(db); return null; }
-        string result = null;
+        IntPtr db = IntPtr.Zero, st = IntPtr.Zero;
         try {
+            if (sqlite3_open_v2(Z(path), out db, 1, IntPtr.Zero) != 0) return null;
             if (sqlite3_prepare_v2(db, Z("SELECT Payload FROM Notification WHERE Id = ?1"), -1, out st, IntPtr.Zero) != 0) return null;
             sqlite3_bind_int64(st, 1, id);
-            if (sqlite3_step(st) == 100) {
-                int n = sqlite3_column_bytes(st, 0);
-                var b = new byte[n];
-                if (n > 0) Marshal.Copy(sqlite3_column_blob(st, 0), b, 0, n);
-                result = Encoding.UTF8.GetString(b);
-            }
-            sqlite3_finalize(st);
-        } finally { sqlite3_close(db); }
-        return result;
+            if (sqlite3_step(st) != 100) return null;
+            // Urutan resmi: pointer blob dulu, baru ukurannya
+            IntPtr blob = sqlite3_column_blob(st, 0);
+            int n = sqlite3_column_bytes(st, 0);
+            if (blob == IntPtr.Zero || n <= 0) return "";
+            var b = new byte[n];
+            Marshal.Copy(blob, b, 0, n);
+            return Encoding.UTF8.GetString(b);
+        } finally {
+            // Statement yang masih terbuka membuat sqlite3_close gagal (koneksi & berkasnya tertahan selamanya)
+            if (st != IntPtr.Zero) sqlite3_finalize(st);
+            if (db != IntPtr.Zero) sqlite3_close(db);
+        }
     }
 }
 '@
@@ -521,7 +699,12 @@ public static class CoverReader {
         return Task.Run(() => {
             object op = openRead.Invoke(reference, null);
             var t = (Task)asTask.Invoke(null, new object[] { op });
-            if (!t.Wait(3000)) throw new TimeoutException("cover");
+            if (!t.Wait(3000)) {
+                // Stream yang akhirnya terbuka setelah batas waktu ditutup (tidak dibiarkan terbuka)
+                t.ContinueWith(x => { try { var d = x.GetType().GetProperty("Result").GetValue(x, null) as IDisposable; if (d != null) d.Dispose(); } catch { } },
+                    TaskContinuationOptions.OnlyOnRanToCompletion);
+                throw new TimeoutException("cover");
+            }
             object stream = t.GetType().GetProperty("Result").GetValue(t, null);
             using (var s = (Stream)asStream.Invoke(null, new object[] { stream }))
             using (var ms = new MemoryStream()) {
@@ -591,44 +774,56 @@ public class VolumeWatcher : IAudioEndpointVolumeCallback {
     public event EventHandler Changed;
     public float Level; public bool Muted; public bool Own; public string Error;
     readonly Dispatcher ui = Dispatcher.CurrentDispatcher;
+    readonly object gate = new object();
     IAudioEndpointVolume vol; IntPtr cbPtr = IntPtr.Zero; string deviceId;
+    volatile bool checking, stopped;
     public string DeviceId { get { return deviceId; } }
     public VolumeWatcher() { Check(); }
     // Pemeriksaan berkala dijalankan di thread latar (membuat objek COM perangkat ~20 ms: kalau di thread
-    // tampilan, frame animasi hilang)
-    volatile bool checking;
+    // tampilan, frame animasi hilang). Tidak ada lagi setelah Stop.
     public void CheckAsync() {
-        if (checking) return;
+        if (checking || stopped) return;
         checking = true;
-        System.Threading.ThreadPool.QueueUserWorkItem(delegate { try { Check(); } finally { checking = false; } });
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate { try { Check(); } catch { } finally { checking = false; } });
     }
-    readonly object gate = new object();
-    // Dipanggil berkala: daftar ulang kalau perangkat output default berganti
-    public void Check() { lock (gate) { CheckCore(); } }
+    // Dipanggil berkala: daftar ulang kalau perangkat output default berganti. Semua perubahan pendaftaran
+    // (termasuk Stop dari thread UI) memegang gate, jadi callback tidak pernah dilepas dua kali.
+    public void Check() { lock (gate) { if (!stopped) CheckCore(); } }
     void CheckCore() {
+        IMMDevice dev; string id;
+        try { dev = SysVolume.Device(); dev.GetId(out id); }
+        catch (Exception ex) { Error = ex.Message; return; }   // pendaftaran yang ada dibiarkan
+        if (id == deviceId && vol != null) return;
+        Unregister();
         try {
-            var dev = SysVolume.Device(); string id; dev.GetId(out id);
-            if (id == deviceId && vol != null) return;
-            Stop();
             vol = SysVolume.Vol(dev); deviceId = id;
             cbPtr = Marshal.GetComInterfaceForObject(this, typeof(IAudioEndpointVolumeCallback));
             Marshal.ThrowExceptionForHR(vol.RegisterControlChangeNotify(cbPtr));
             Error = null;
-        } catch (Exception ex) { Error = ex.Message; }
+        } catch (Exception ex) {
+            Error = ex.Message;
+            // Gagal mendaftar: dibersihkan supaya dicoba lagi di pemeriksaan berikutnya (kalau tidak, perubahan
+            // volume tidak pernah dilaporkan lagi sampai perangkatnya berganti)
+            Unregister();
+        }
     }
-    public void Stop() {
-        try { if (vol != null && cbPtr != IntPtr.Zero) vol.UnregisterControlChangeNotify(cbPtr); } catch { }
-        if (cbPtr != IntPtr.Zero) { Marshal.Release(cbPtr); cbPtr = IntPtr.Zero; }
+    // Hanya dengan gate dipegang
+    void Unregister() {
+        IntPtr p = cbPtr; cbPtr = IntPtr.Zero;
+        try { if (vol != null && p != IntPtr.Zero) vol.UnregisterControlChangeNotify(p); } catch { }
+        if (p != IntPtr.Zero) Marshal.Release(p);
         vol = null; deviceId = null;
     }
+    public void Stop() { stopped = true; lock (gate) { Unregister(); } }
     public int OnNotify(IntPtr data) {
         // AUDIO_VOLUME_NOTIFICATION_DATA: GUID konteks, BOOL bMuted, float fMasterVolume, ...
+        // Nilainya dibawa utuh ke thread UI (notifikasi berikutnya tidak bisa menimpanya sebelum dibaca)
         try {
             var ctx = new byte[16]; Marshal.Copy(data, ctx, 0, 16);
-            Own = new Guid(ctx) == SysVolume.Own;
-            Muted = Marshal.ReadInt32(data, 16) != 0;
-            Level = BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(data, 20)), 0);
-            ui.BeginInvoke(new Action(() => { var h = Changed; if (h != null) h(this, EventArgs.Empty); }));
+            bool own = new Guid(ctx) == SysVolume.Own;
+            bool muted = Marshal.ReadInt32(data, 16) != 0;
+            float level = BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(data, 20)), 0);
+            ui.BeginInvoke(new Action(() => { Own = own; Muted = muted; Level = level; var h = Changed; if (h != null) h(this, EventArgs.Empty); }));
         } catch { }
         return 0;
     }
@@ -857,6 +1052,9 @@ $asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Ob
 # Untuk CoverReader (thread latar): buka thumbnail, tunggu, ubah ke stream .NET
 $COVER_OPEN_READ = [Windows.Storage.Streams.IRandomAccessStreamReference].GetMethod('OpenReadAsync')
 $COVER_AS_TASK = $asTaskGeneric.MakeGenericMethod([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
+# Operasi WinRT dari aplikasi lain (cover, logo, info lagu) memang harus ditunggu dengan cara ini (thread UI
+# tetap memproses pesan): sebagian objeknya terikat ke thread UI dan baru selesai kalau thread UI memproses
+# pesan (mis. thumbnail Spotify). Menunggu tanpa memproses pesan (IslandWait) membuatnya macet sampai batas waktu.
 function Await($op, [Type]$type) {
     $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op))
     if (-not $task.Wait(3000)) { throw 'WinRT timeout' }
@@ -1373,7 +1571,7 @@ function Get-ToastPhoto($id, [switch]$NoNet) {
             if ($NoNet) { return $null }
             # Ditunggu sebentar saja supaya island tidak tersendat kalau jaringan lambat
             $t = $http.GetByteArrayAsync($src)
-            if ($t.Wait(1500)) { $bytes = $t.Result }
+            if ([IslandWait]::Done($t, 1500) -and $t.Status -eq 'RanToCompletion') { $bytes = $t.Result }
         } else {
             $path = if ($src -match '^file:') { ([uri]$src).LocalPath } else { $src }
             if ($path -and (Test-Path -LiteralPath $path)) { $bytes = [IO.File]::ReadAllBytes($path) }
@@ -1395,14 +1593,15 @@ function Convert-Notif($un) {
     $app = ''; $aumid = ''
     # Dibaca terpisah: DisplayInfo bisa gagal untuk sebagian aplikasi, AUMID-nya tetap dibutuhkan (ikon, klik untuk membuka)
     try { $aumid = $un.AppInfo.AppUserModelId } catch {}
-    try { $app = $un.AppInfo.DisplayInfo.DisplayName } catch {}
+    try { $app = [IslandText]::Safe([string]$un.AppInfo.DisplayInfo.DisplayName, 120) } catch {}
     $texts = @()
     try {
         $binding = $un.Notification.Visual.GetBinding([Windows.UI.Notifications.KnownNotificationBindings]::ToastGeneric)
         if ($binding) { $texts = @($binding.GetTextElements() | ForEach-Object { $_.Text }) }
     } catch {}
-    $title = if ($texts.Count -gt 0) { $texts[0] } else { $app }
-    $body = (@($texts | Select-Object -Skip 1) -join ' ') -replace '\s+', ' '
+    # Teks dari aplikasi lain disaring dulu (lihat IslandText)
+    $title = if ($texts.Count -gt 0) { [IslandText]::Safe([string]$texts[0], 300) } else { $app }
+    $body = [IslandText]::Safe(((@($texts | Select-Object -Skip 1) -join ' ') -replace '\s+', ' '), 1000)
     $icon = Get-AppIcon $un $aumid
     [PSCustomObject]@{
         Id     = $un.Id
@@ -1730,7 +1929,8 @@ function Complete-PollMedia($sess, $playing, $app, $old, $props) {
         $cv = Read-Cover $props.Thumbnail
         $tl = Get-Timeline $sess $playing
         $script:media = [PSCustomObject]@{
-            Key = $key; App = $app; Title = $props.Title; Artist = $props.Artist; Album = $props.AlbumTitle
+            Key = $key; App = $app; Title = [IslandText]::Safe([string]$props.Title, 300); Artist = [IslandText]::Safe([string]$props.Artist, 300)
+            Album = [IslandText]::Safe([string]$props.AlbumTitle, 300)
             Art = $cv.Art; Accent = $cv.Accent; Accent2 = $cv.Accent2; Accent3 = $cv.Accent3; CoverHash = $cv.Hash; CoverChecks = 0
             Playing = $playing; Session = $sess; Pos = $tl.Pos; End = $tl.End; PosAt = (Get-Date)
         }
@@ -3135,7 +3335,8 @@ function Get-LyricsFile($title, $artist) {
 
 # Data lirik satu lagu: Lines (bersinkron) atau Plain (teks biasa, waktunya ditaksir), Offset (detik)
 function New-LyricsEntry($d, $file) {
-    $e = @{ Synced = [string]$d.Synced; Plain = [string]$d.Plain; Duration = [double]$d.Duration; None = [bool]$d.None
+    # Lirik dari internet/berkas disaring dulu (lihat IslandText)
+    $e = @{ Synced = [IslandText]::Safe([string]$d.Synced, 0); Plain = [IslandText]::Safe([string]$d.Plain, 0); Duration = [double]$d.Duration; None = [bool]$d.None
         Offset = [double]$d.Offset; Fetched = [string]$d.Fetched; File = $file; Lines = $null }
     if (-not $e.Fetched) { $e.Fetched = (Get-Date).ToString('o') }
     if ($e.Synced) { $e.Lines = @(Parse-Lrc $e.Synced) }
@@ -3211,7 +3412,7 @@ function Get-Lyrics {
 function Estimate-PlainLines($text, $end) {
     $items = @(); $total = 0.0
     foreach ($l in ("$text" -split "`r?`n")) {
-        $t = $l.Trim()
+        $t = [IslandText]::Safe($l.Trim(), 300)
         # Baris kosong = jeda antar bait
         $w = if ($t) { 6.0 + $t.Length } else { 10.0 }
         $items += @{ Text = $t; W = $w }; $total += $w
@@ -3358,6 +3559,8 @@ function Parse-Lrc($text) {
         # diperlakukan seperti baris kosong, jadi island menampilkan judul & artis, bukan simbolnya
         if ($clean -notmatch '[\p{L}\p{N}]') { $clean = ''; $words = @() }
         foreach ($w in $words) { $w.C = [Math]::Max(0, $w.C - $lead) }
+        # Baris kepanjangan (mis. berkas rusak tanpa baris baru) dipotong supaya tetap ringan digambar
+        if ($clean.Length -gt 300) { $clean = [IslandText]::Safe($clean, 300); $words = @($words | Where-Object { $_.C -lt $clean.Length }) }
         foreach ($t in $tags) {
             $out.Add([PSCustomObject]@{ T = [double]$t.Groups[1].Value * 60 + [double]$t.Groups[2].Value; Text = $clean; Words = $words; End = 0.0 })
         }
@@ -3428,11 +3631,13 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using Microsoft.Win32.SafeHandles;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 public class LyricSeg { public string Text; public string Ruby; }
-public class LyricParts { public LyricSeg[] Segs; public bool HasRuby; public string Romaji; }
+// Pending: furigana belum siap (pembaca Windows masih bekerja di latar); jangan disimpan, tanyakan lagi nanti
+public class LyricParts { public LyricSeg[] Segs; public bool HasRuby; public string Romaji; public bool Pending; }
 public static class LyricReader {
     class Item { public string D, Y; public bool Phrase; }
     static MethodInfo getWords;
@@ -3449,10 +3654,13 @@ public static class LyricReader {
     static readonly ConcurrentDictionary<string, LyricParts> done = new ConcurrentDictionary<string, LyricParts>();
     static readonly object gate = new object();
     static readonly List<string> queue = new List<string>();
+    // Baris yang sedang ditunggu thread UI (lihat Get) dan hitungan gagal baca per baris
+    static readonly Dictionary<string, ManualResetEvent> waiting = new Dictionary<string, ManualResetEvent>();
+    static readonly Dictionary<string, int> failures = new Dictionary<string, int>();
+    // Pembaca Windows HANYA dipanggil dari thread ini (STA, tetap hidup menunggu antrean berikutnya)
     static Thread worker;
-    // Pembaca Windows tidak dipanggil dari dua thread sekaligus (thread latar & thread UI saat baris belum siap)
-    static readonly object analyzerGate = new object();
     static string lastError;
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(SafeWaitHandle h, uint ms);
 
     public static void Init(MethodInfo words, PropertyInfo text, PropertyInfo yomi, PropertyInfo phrase,
             string kanjiPattern, string japanesePattern, IDictionary kanaRomaji, IDictionary punctuation, IEnumerable particleList) {
@@ -3470,12 +3678,49 @@ public static class LyricReader {
     // Hasil yang sudah dihitung (di latar atau sebelumnya), null kalau belum
     public static LyricParts TryGet(string text) { LyricParts p; return done.TryGetValue(text ?? "", out p) ? p : null; }
 
-    // Hasil sekarang juga: dari simpanan, atau dihitung di thread pemanggil kalau belum ada
+    // Hasil sekarang juga. Baris bukan Jepang dihitung di sini (tanpa pembaca Windows). Baris Jepang yang belum
+    // siap didahulukan di antrean thread latar lalu ditunggu tanpa memproses pesan Windows (menunggu biasa di
+    // thread UI ikut menjalankan kode island lain di tengah-tengah). Jadi pembaca Windows selalu dipakai dari
+    // satu thread saja. Belum selesai dalam 1,5 detik (pembaca baru mulai): baris tanpa furigana dulu (Pending).
     public static LyricParts Get(string text) {
         text = text ?? "";
         LyricParts p;
-        if (!done.TryGetValue(text, out p)) { p = Build(text, false); done[text] = p; }
-        return p;
+        if (done.TryGetValue(text, out p)) return p;
+        if (getWords == null || !japanese.IsMatch(text)) { p = Build(text, false); done[text] = p; return p; }
+        ManualResetEvent ev;
+        Enter();
+        try {
+            if (done.TryGetValue(text, out p)) return p;
+            if (!waiting.TryGetValue(text, out ev)) { ev = new ManualResetEvent(false); waiting[text] = ev; }
+            queue.Remove(text);
+            queue.Insert(0, text);
+            StartWorker();
+            Monitor.Pulse(gate);
+        } finally { Monitor.Exit(gate); }
+        WaitForSingleObject(ev.SafeWaitHandle, 1500);
+        if (done.TryGetValue(text, out p)) return p;
+        return Plain(text, true);
+    }
+
+    // Kunci antrean dari thread UI: lock biasa yang harus menunggu di thread STA ikut memproses pesan Windows
+    static void Enter() {
+        if (Monitor.TryEnter(gate)) return;
+        var sw = new SpinWait();
+        while (!Monitor.TryEnter(gate)) sw.SpinOnce();
+    }
+
+    // Dengan kunci antrean dipegang
+    static void StartWorker() {
+        if (worker != null && worker.IsAlive) return;
+        worker = new Thread(Work) { IsBackground = true, Name = "LyricReader" };
+        worker.SetApartmentState(ApartmentState.STA);
+        worker.Start();
+    }
+
+    // Baris apa adanya tanpa furigana/romaji
+    static LyricParts Plain(string text, bool pending) {
+        var segs = string.IsNullOrEmpty(text) ? new LyricSeg[0] : new LyricSeg[] { new LyricSeg { Text = text } };
+        return new LyricParts { Segs = segs, HasRuby = false, Romaji = null, Pending = pending };
     }
 
     // Baris-baris berbahasa Jepang dihitung di thread latar: mulai baris ke-$from ke bawah, lalu sisanya ke
@@ -3483,35 +3728,52 @@ public static class LyricReader {
     // (pembaca Windows gagal kalau dipanggil dari thread pool/MTA) dan tetap hidup menunggu antrean berikutnya,
     // jadi objek WinRT pembacanya tidak berpindah-pindah apartemen.
     public static void Prepare(string[] texts, int from) {
-        lock (gate) {
+        Enter();
+        try {
             queue.Clear();
             if (done.Count > 4000) done.Clear();
             int n = texts.Length;
             from = Math.Max(0, Math.Min(from, n));
             for (int i = from; i < n; i++) Enqueue(texts[i]);
             for (int i = from - 1; i >= 0; i--) Enqueue(texts[i]);
+            // Baris yang masih ditunggu (waktu tunggunya sudah habis) tetap dikerjakan lebih dulu
+            foreach (var t in waiting.Keys) if (!queue.Contains(t)) queue.Insert(0, t);
             if (queue.Count == 0) return;
-            if (worker == null || !worker.IsAlive) {
-                worker = new Thread(Work) { IsBackground = true, Name = "LyricReader" };
-                worker.SetApartmentState(ApartmentState.STA);
-                worker.Start();
-            }
+            StartWorker();
             Monitor.Pulse(gate);
-        }
+        } finally { Monitor.Exit(gate); }
     }
     static void Enqueue(string t) {
         if (!string.IsNullOrEmpty(t) && japanese.IsMatch(t) && !done.ContainsKey(t) && !queue.Contains(t)) queue.Add(t);
     }
     static void Work() {
         while (true) {
-            string t;
-            lock (gate) {
-                while (queue.Count == 0) Monitor.Wait(gate);
-                t = queue[0]; queue.RemoveAt(0);
+            string t = null;
+            try {
+                lock (gate) {
+                    while (queue.Count == 0) Monitor.Wait(gate);
+                    t = queue[0]; queue.RemoveAt(0);
+                }
+                if (!done.ContainsKey(t)) {
+                    LyricParts p = null;
+                    try { p = Build(t, true); } catch (Exception ex) { lastError = ex.Message; }
+                    if (p != null) done[t] = p;
+                    else {
+                        // Gagal dibaca: dicoba lagi saat dibutuhkan; gagal dua kali = tampil tanpa furigana
+                        int n;
+                        lock (gate) { failures.TryGetValue(t, out n); failures[t] = ++n; if (failures.Count > 1000) failures.Clear(); }
+                        if (n >= 2) done[t] = Plain(t, false);
+                    }
+                }
+            } catch (Exception ex) { lastError = ex.Message; }
+            finally {
+                // Thread UI yang menunggu baris ini dibangunkan (berhasil atau tidak)
+                if (t != null) {
+                    ManualResetEvent ev = null;
+                    try { lock (gate) { if (waiting.TryGetValue(t, out ev)) waiting.Remove(t); } } catch { }
+                    if (ev != null) { try { ev.Set(); } catch { } }
+                }
             }
-            if (done.ContainsKey(t)) continue;
-            // Gagal dibaca di latar: tidak disimpan, nanti dihitung ulang saat dibutuhkan
-            try { var p = Build(t, true); if (p != null) done[t] = p; } catch (Exception ex) { lastError = ex.Message; }
         }
     }
 
@@ -3556,22 +3818,21 @@ public static class LyricReader {
         return o.ToString();
     }
 
-    // Teks lirik -> potongan {Text, Ruby} (furigana hanya di atas kanji) + romaji untuk baris berbahasa Jepang
-    // $worker: dipanggil dari thread latar; kalau pembaca Windows gagal hasilnya null (tidak disimpan)
+    // Teks lirik -> potongan {Text, Ruby} (furigana hanya di atas kanji) + romaji untuk baris berbahasa Jepang.
+    // Pembaca Windows hanya dipakai dari thread latar ($worker); kalau gagal hasilnya null (tidak disimpan).
+    // Dari thread UI hanya untuk baris bukan Jepang (tanpa pembaca).
     static LyricParts Build(string text, bool worker) {
         var items = new List<Item>();
-        if (getWords != null && japanese.IsMatch(text)) {
+        if (worker && getWords != null && japanese.IsMatch(text)) {
             try {
                 var ds = new List<string>(); var ys = new List<string>(); var ph = new List<bool>();
-                lock (analyzerGate) {
-                    var words = getWords.Invoke(null, new object[] { text, false }) as IEnumerable;
-                    if (words != null) {
-                        foreach (object w in words) {
-                            ds.Add((string)pText.GetValue(w, null) ?? ""); ys.Add((string)pYomi.GetValue(w, null)); ph.Add((bool)pPhrase.GetValue(w, null));
-                            if (Marshal.IsComObject(w)) Marshal.ReleaseComObject(w);
-                        }
-                        if (Marshal.IsComObject(words)) Marshal.ReleaseComObject(words);
+                var words = getWords.Invoke(null, new object[] { text, false }) as IEnumerable;
+                if (words != null) {
+                    foreach (object w in words) {
+                        ds.Add((string)pText.GetValue(w, null) ?? ""); ys.Add((string)pYomi.GetValue(w, null)); ph.Add((bool)pPhrase.GetValue(w, null));
+                        if (Marshal.IsComObject(w)) Marshal.ReleaseComObject(w);
                     }
+                    if (Marshal.IsComObject(words)) Marshal.ReleaseComObject(words);
                 }
                 // Pembaca Windows mengubah huruf Latin/spasi jadi lebar penuh. Kalau panjang totalnya sama,
                 // teks tiap kata diambil dari teks asli supaya tampilannya tidak berubah.
@@ -3584,8 +3845,7 @@ public static class LyricReader {
                 }
             } catch (Exception ex) {
                 lastError = (ex.InnerException ?? ex).Message;
-                if (worker) return null;
-                items.Clear();
+                return null;
             }
         }
         string romaji = null;
@@ -3734,6 +3994,10 @@ function Get-LineParts($line) {
     if (-not $line.PSObject.Properties['Parts'] -or $line.PartsVer -ne $script:partsVer) {
         $line | Add-Member -NotePropertyName Parts -NotePropertyValue (Get-LyricParts $line.Text) -Force
         $line | Add-Member -NotePropertyName PartsVer -NotePropertyValue $script:partsVer -Force
+    } elseif ($line.Parts.Pending) {
+        # Waktu itu furigana belum siap (pembaca baru mulai): pakai hasil latar kalau sekarang sudah ada, tanpa menunggu
+        $p = [LyricReader]::TryGet([string]$line.Text)
+        if ($p) { $line.Parts = $p }
     }
     $line.Parts
 }
@@ -3853,7 +4117,7 @@ function Set-MiniLyric($line, $pos, [switch]$Quiet) {
         if ($old.Tag -eq 'out') { continue }
         if ($old.Name -ne 'marquee') { $wasLyric = $true }   # 'marquee' = judul berjalan + wave kecil
         $old.Tag = 'out'
-        Animate60 $old.RenderTransform $yp 0.0 -8.0 200
+        Animate60 $old.RenderTransform $yp 0.0 (-8.0) 200
         Animate60 $old ([System.Windows.UIElement]::OpacityProperty) ([double]$old.Opacity) 0.0 150
     }
     $lyricOutTimer.Stop(); $lyricOutTimer.Start()
@@ -4728,17 +4992,22 @@ function Toggle-LyricOption($name) {
         $els = if ($name -eq 'Furigana') { $tag.Rubies } elseif ($tag.Romaji) { @($tag.Romaji.Child) } else { @() }
         foreach ($el in $els) { Use-PageScale $el $live }
     }
-    if (-not $script:following) { $script:following = $true; $lp.Panel.add_LayoutUpdated($followHandler) }
+    # Dipasang ke panel halaman ini. Kalau masih terpasang di panel halaman lama (halaman dibangun ulang dalam
+    # 400 ms), dilepas dulu dari sana: kalau tidak, handler tertinggal dan berjalan di setiap tata letak selamanya
+    if ($script:followPanel -and -not [object]::ReferenceEquals($script:followPanel, $lp.Panel)) {
+        $script:followPanel.remove_LayoutUpdated($followHandler); $script:followPanel = $null
+    }
+    if (-not $script:followPanel) { $script:followPanel = $lp.Panel; $lp.Panel.add_LayoutUpdated($followHandler) }
     Animate60 $live $prop $from $final 340
     $followTimer.Stop(); $followTimer.Start()
 }
 
 # Selama animasi: baris aktif tetap di tengah. LayoutUpdated jalan setelah tata letak frame ini selesai
 # dan sebelum digambar, jadi geseran yang diatur di sini ikut frame yang sama (tanpa tertinggal).
-$script:following = $false
+$script:followPanel = $null
 $followHandler = [EventHandler]{
     $lp = $script:lyricsPage
-    if (-not $lp) { return }
+    if (-not $lp -or -not [object]::ReferenceEquals($lp.Panel, $script:followPanel)) { return }
     $b = $lp.Blocks[[Math]::Max(0, $lp.Cur)]
     try {
         $p = $b.TranslatePoint((New-Object System.Windows.Point(0, 0)), $lp.Panel)
@@ -4751,9 +5020,9 @@ $followTimer.Interval = Ms 400
 $followTimer.Add_Tick({
     $followTimer.Stop()
     $lp = $script:lyricsPage
-    if ($script:following) {
-        $script:following = $false
-        if ($lp) { $lp.Panel.remove_LayoutUpdated($followHandler) }
+    if ($script:followPanel) {
+        $script:followPanel.remove_LayoutUpdated($followHandler)
+        $script:followPanel = $null
     }
     if ($lp) { Measure-LyricsPage }
 })
@@ -5159,7 +5428,8 @@ $GLYPH_HEADPHONE = [string][char]0xE7F6
 $BT_COLOR = Rgb 10 132 255
 $MMDEV_RENDER = 'SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
 $script:audioDevice = $null
-$script:batteryJob = $null
+$script:batteryJobs = New-Object System.Collections.ArrayList
+$script:headsetName = $null
 
 # Nama dan jenis koneksi perangkat output dari ID endpoint Core Audio ("{0.0.0.00000000}.{guid}")
 function Get-EndpointInfo($id) {
@@ -5173,7 +5443,7 @@ function Get-EndpointInfo($id) {
         $device = $k.GetValue('{b3f8fa53-0004-438e-9003-51a46e139bfc},6')
         $enum = "$($k.GetValue('{a45c254e-df1c-4efd-8020-67d146a850e0},24')) $($k.GetValue('{b3f8fa53-0004-438e-9003-51a46e139bfc},2'))"
     } finally { $k.Close() }
-    @{ Name = $(if ($device) { "$device" } else { "$endpoint" }); Bluetooth = $enum -match 'BTH' }
+    @{ Name = [IslandText]::Safe($(if ($device) { "$device" } else { "$endpoint" }), 120); Bluetooth = $enum -match 'BTH' }
 }
 
 $BATTERY_JOB = {
@@ -5196,10 +5466,10 @@ function Check-AudioDevice {
     # Perangkat yang sudah tersambung saat island mulai tidak perlu diumumkan
     if ($first -or -not $script:settings.Headset) { return }
     $info = Get-EndpointInfo $id
-    if ($info -and $info.Bluetooth) { Show-Headset $info.Name -1 }
+    if ($info -and $info.Bluetooth) { Show-Headset $info.Name (-1) }
 }
 
-function Show-Headset($name, $battery) {
+function Show-Headset($name, [int]$battery) {
     if (-not (Can-ShowActivity)) { return }
     $g = New-Columns 'Auto', '*', 'Auto'
     $g.Margin = '10,0,14,0'
@@ -5220,14 +5490,18 @@ function Show-Headset($name, $battery) {
     Set-HeadsetBattery $right $battery
     Show-Activity 'headset' $g 290 52 $BT_COLOR 4000
     $script:headsetUI = $right
-    # Baterai belum diketahui: cari di latar belakang, pil diperbarui kalau ketemu
+    # Baterai belum diketahui: cari di latar belakang, pil diperbarui kalau ketemu. Pencarian sebelumnya (perangkat
+    # lain) tetap ditunggu sampai selesai lalu dibuang; hasilnya hanya dipakai untuk perangkatnya sendiri.
+    $script:headsetName = $name
     if ($battery -lt 0) {
-        $script:batteryJob = Start-BgJob $BATTERY_JOB @($name)
+        $job = Start-BgJob $BATTERY_JOB @($name)
+        $job.Name = $name; $job.At = Get-Date
+        [void]$script:batteryJobs.Add($job)
         $batteryTimer.Start()
     }
 }
 
-function Set-HeadsetBattery($panel, $battery) {
+function Set-HeadsetBattery($panel, [int]$battery) {
     $panel.Children.Clear()
     if ($battery -lt 0) { return }
     $color = if ($battery -le 20) { Rgb 255 69 58 } else { Rgb 48 209 88 }
@@ -5242,12 +5516,19 @@ function Set-HeadsetBattery($panel, $battery) {
 $batteryTimer = New-Object System.Windows.Threading.DispatcherTimer
 $batteryTimer.Interval = Ms 300
 $batteryTimer.Add_Tick({
-    $r = Receive-BgJob $script:batteryJob
-    if (-not $r) { return }
-    $batteryTimer.Stop(); $script:batteryJob = $null
-    if ($r.Battery -ge 0 -and $script:mode -eq 'activity' -and $script:activity.Kind -eq 'headset' -and $script:headsetUI) {
-        Set-HeadsetBattery $script:headsetUI $r.Battery
+    foreach ($job in @($script:batteryJobs)) {
+        $r = Receive-BgJob $job
+        if (-not $r) {
+            # Macet (mis. layanan perangkat tidak menjawab): dihentikan tanpa ditunggu dan tidak dipantau lagi
+            if (((Get-Date) - $job.At).TotalSeconds -gt 60) { try { [void]$job.PS.BeginStop($null, $null) } catch {}; $script:batteryJobs.Remove($job) }
+            continue
+        }
+        $script:batteryJobs.Remove($job)
+        if ($r.Battery -ge 0 -and $job.Name -eq $script:headsetName -and $script:mode -eq 'activity' -and $script:activity.Kind -eq 'headset' -and $script:headsetUI) {
+            Set-HeadsetBattery $script:headsetUI $r.Battery
+        }
     }
+    if ($script:batteryJobs.Count -eq 0) { $batteryTimer.Stop() }
 })
 
 # ---------- Mikrofon & kamera ----------
@@ -5551,6 +5832,15 @@ function Remove-IslandItem($id) {
 # Tampil sekali setelah island diperbarui (pop-up, lalu tetap di daftar notifikasi sampai dihapus), dan lewat
 # menu "Yang baru di versi ini". Terbaru dulu; tiap versi berisi poin singkat dalam dua bahasa.
 $CHANGELOG = @(
+    @{ V = '1.3.8'
+        Id = @('Teks aneh yang bertumpuk berlebihan (huruf "zalgo" di chat, judul, atau lirik) tidak bisa lagi membuat island crash',
+            'Pil headset Bluetooth tidak lagi menampilkan "-1%", baterainya kini dicari seperti seharusnya',
+            'Pembaca furigana dan pemantau volume lebih stabil, beberapa kebocoran kecil ditutup',
+            'Kalau island tetap crash, titik penyebabnya di dalam Windows ikut dicatat di island.log')
+        En = @('Weird over-stacked text ("zalgo" letters in chats, titles or lyrics) can no longer crash the island',
+            'The Bluetooth headset pill no longer shows "-1%"; its battery is now looked up as intended',
+            'Steadier furigana reader and volume watcher, a few small leaks fixed',
+            'If the island still crashes, the exact spot inside Windows is also written to island.log') }
     @{ V = '1.3.7'
         Id = @('Kalau island sempat crash, sekarang langsung pulih dalam beberapa detik (tidak membeku dulu), dan penyebabnya dicatat di island.log',
             'Pembaca furigana lebih stabil')
@@ -6097,6 +6387,9 @@ $pollTimer.Add_Tick({
     if ($script:volWatcher) {
         if (($script:pollCount % 3) -eq 0) { $script:volWatcher.CheckAsync() }
         Queue-Job 'audio-device' { Check-AudioDevice }
+        # Pemeriksaan latar yang gagal (mis. perangkat sedang berganti) dicatat sekali tiap pesannya berubah
+        $ve = $script:volWatcher.Error
+        if ($ve -ne $script:volError) { $script:volError = $ve; if ($ve) { Log "volume watcher: $ve" } }
     }
 })
 
@@ -6265,7 +6558,7 @@ function Close-Menu {
         $tt = New-Object System.Windows.Media.TranslateTransform
         $el.RenderTransform = $tt
         Animate60 $el ([System.Windows.UIElement]::OpacityProperty) 1 0 210
-        Animate60 $tt ([System.Windows.Media.TranslateTransform]::YProperty) 0 -6 220
+        Animate60 $tt ([System.Windows.Media.TranslateTransform]::YProperty) 0 (-6) 220
     }
     $menuCloseTimer.Start()
 }
@@ -6312,9 +6605,9 @@ function Exit-Island {
     Animate $sensorDots ([System.Windows.UIElement]::OpacityProperty) 0 300
     $up = New-Object System.Windows.Media.TranslateTransform
     $island.RenderTransform = $up
-    Animate $up ([System.Windows.Media.TranslateTransform]::YProperty) -24 440
+    Animate $up ([System.Windows.Media.TranslateTransform]::YProperty) (-24) 440
     Animate $island ([System.Windows.UIElement]::OpacityProperty) 0 400
-    Animate $handle.RenderTransform ([System.Windows.Media.TranslateTransform]::YProperty) -12 440
+    Animate $handle.RenderTransform ([System.Windows.Media.TranslateTransform]::YProperty) (-12) 440
     Animate $handle ([System.Windows.UIElement]::OpacityProperty) 0 380
     Animate $handle ([System.Windows.FrameworkElement]::WidthProperty) 8 420
     $exitTimer.Start()
@@ -6576,7 +6869,7 @@ $window.Add_Loaded({
     try {
         $script:volWatcher = New-Object VolumeWatcher
         $script:volWatcher.add_Changed({ try { On-VolumeChanged } catch { Log "volume osd: $_" } })
-        if ($script:volWatcher.Error) { Log "volume watcher: $($script:volWatcher.Error)" }
+        $script:volError = $script:volWatcher.Error; if ($script:volError) { Log "volume watcher: $($script:volError)" }
     } catch { Log "volume watcher: $_" }
     # Kecerahan hanya tersedia di laptop / monitor yang mendukungnya
     try {
