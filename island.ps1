@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.9'
+$APP_VERSION = '1.3.10'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -22,10 +22,11 @@ $settingsFile = Join-Path $here 'settings.json'
 # PopupFade: pop-up lagu baru memudar seperti mini island selama kursor di dekatnya (mati: tetap tampil & bisa diklik).
 # LastVersion: versi island saat terakhir jalan (catatan perubahan tampil sekali setelah diperbarui).
 # Eco: mode hemat daya 'auto' (PC lebih lemah / laptop pakai baterai), 'on' (selalu), 'off' (tidak pernah).
+# HideInCapture: island tidak ikut screenshot (Win+Shift+S, PrintScreen, Game Bar, OBS, berbagi layar).
 $script:settings = [PSCustomObject]@{
     Lyrics = $true; Romaji = $true; Furigana = $true; LyricDelay = 0.15; Language = ''; Monitor = ''
     VolumeOsd = $true; Charging = $true; MicCam = $true; Headset = $true; Glow = $true; CheckUpdates = $true; SkipVersion = ''; NotifiedVersion = ''
-    AppVolume = $true; EqStyle = 'bars'; PopupFade = $true; LastVersion = ''; Eco = 'auto'
+    AppVolume = $true; EqStyle = 'bars'; PopupFade = $true; LastVersion = ''; Eco = 'auto'; HideInCapture = $true
 }
 # Belum ada settings.json = pemasangan baru (tidak perlu catatan perubahan)
 $script:hadSettings = Test-Path $settingsFile
@@ -103,6 +104,10 @@ public static class IslandNative {
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+    // 0x11 = WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+): jendela tetap tampil di layar, tapi tidak ikut screenshot,
+    // rekaman, atau berbagi layar; 0 = normal
+    [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+    [DllImport("user32.dll")] public static extern bool GetWindowDisplayAffinity(IntPtr hWnd, out uint affinity);
     public static int[] CursorPos() { POINT p; GetCursorPos(out p); return new int[] { p.X, p.Y }; }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct DEVMODE {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
@@ -4426,20 +4431,16 @@ function New-ListHeader {
     $btn = New-Object System.Windows.Controls.TextBlock
     $btn.FontSize = 11; $btn.FontWeight = 'SemiBold'; $btn.Cursor = 'Hand'
     $btn.HorizontalAlignment = 'Right'; $btn.VerticalAlignment = 'Center'
-    if ($script:confirmClear) { $btn.Text = T 'Klik lagi untuk hapus semua' 'Click again to clear all'; $btn.Foreground = Brush '#FF6961' }
-    else { $btn.Text = T 'Hapus semua' 'Clear all'; $btn.Foreground = Brush '#A1A1A6' }
+    # Langsung menghapus semua (tanpa klik kedua); teksnya menerang halus saat disentuh
+    $btn.Text = T 'Hapus semua' 'Clear all'
+    $btn.Foreground = New-Object System.Windows.Media.SolidColorBrush((Rgb 161 161 166))
+    $btn.Add_MouseEnter({ param($s, $e) Fade-Color $s.Foreground (Rgb 255 255 255) })
+    $btn.Add_MouseLeave({ param($s, $e) Fade-Color $s.Foreground (Rgb 161 161 166) })
     $btn.Add_MouseLeftButtonUp({
         param($s, $e)
         $e.Handled = $true
-        if ($script:confirmClear) {
-            $script:confirmClear = $false; $confirmTimer.Stop()
-            $s.Text = T 'Hapus semua' 'Clear all'; $s.Foreground = Brush '#A1A1A6'
-            $rows = @($listPanel.Children | Where-Object { $_.Tag -and $_.Tag.N })
-            Start-Delete $rows @() $true
-        } else {
-            $script:confirmClear = $true; $confirmTimer.Start()
-            Show-List -Refresh
-        }
+        $rows = @($listPanel.Children | Where-Object { $_.Tag -and $_.Tag.N })
+        Start-Delete $rows @() $true
     })
     [void]$hg.Children.Add($btn)
     $hg
@@ -4548,9 +4549,70 @@ function New-PageDot($p) {
     $d.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Switch-ListPage $s.Tag })
     $d
 }
+# Warna kuas berganti halus
+function Fade-Color($brush, $color, $ms = 180) {
+    $ca = New-Object System.Windows.Media.Animation.ColorAnimation($color, (New-Object System.Windows.Duration (Ms $ms)))
+    [System.Windows.Media.Animation.Timeline]::SetDesiredFrameRate($ca, $ANIM_FPS)
+    $brush.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $ca)
+}
+
+# Tombol pengaturan (roda gigi) di kanan bawah daftar, sebaris dengan titik halaman: membuka menu yang sama
+# dengan klik kanan, tepat di bawah tombolnya. Saat disentuh lingkarannya menampak, ikonnya menerang dan
+# berputar pelan 60 derajat.
+$GLYPH_GEAR = [string][char]0xE713
+function New-SettingsButton {
+    $b = New-Object System.Windows.Controls.Grid
+    $b.Width = 22; $b.Height = 18; $b.HorizontalAlignment = 'Right'; $b.VerticalAlignment = 'Center'; $b.Margin = '0,0,2,0'
+    $b.Cursor = 'Hand'; $b.Background = Brush '#01000000'; $b.ToolTip = T 'Pengaturan' 'Settings'
+    $bg = New-Object System.Windows.Controls.Border
+    $bg.CornerRadius = New-Object System.Windows.CornerRadius(9); $bg.Background = Brush '#2EFFFFFF'; $bg.Opacity = 0
+    [void]$b.Children.Add($bg)
+    $t = New-Object System.Windows.Controls.TextBlock
+    $t.Text = $GLYPH_GEAR; $t.FontFamily = 'Segoe Fluent Icons, Segoe MDL2 Assets'; $t.FontSize = 11
+    $t.HorizontalAlignment = 'Center'; $t.VerticalAlignment = 'Center'
+    $t.Foreground = New-Object System.Windows.Media.SolidColorBrush((Rgb 161 161 166))
+    $rot = New-Object System.Windows.Media.RotateTransform(0)
+    $t.RenderTransformOrigin = '0.5,0.5'; $t.RenderTransform = $rot
+    [void]$b.Children.Add($t)
+    $b.Tag = @{ Bg = $bg; Rot = $rot; Fg = $t.Foreground }
+    $b.Add_MouseEnter({ param($s, $e) Set-GearHover $s $true })
+    $b.Add_MouseLeave({ param($s, $e) if (-not ($menu.IsOpen -and [object]::ReferenceEquals($menu.PlacementTarget, $s))) { Set-GearHover $s $false } })
+    $b.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Open-SettingsMenu $s })
+    $b
+}
+function Set-GearHover($b, $on) {
+    Animate60 $b.Tag.Bg ([System.Windows.UIElement]::OpacityProperty) ([double]$b.Tag.Bg.Opacity) $(if ($on) { 1.0 } else { 0.0 }) 180
+    Animate60 $b.Tag.Rot ([System.Windows.Media.RotateTransform]::AngleProperty) ([double]$b.Tag.Rot.Angle) $(if ($on) { 60.0 } else { 0.0 }) 420
+    Fade-Color $b.Tag.Fg $(if ($on) { Rgb 255 255 255 } else { Rgb 161 161 166 })
+}
+# Menu di bawah tombol, rata kanan dengan tombolnya (kalau di bawah tidak muat: di atasnya)
+$GEAR_PLACEMENT = [System.Windows.Controls.Primitives.CustomPopupPlacementCallback]{
+    param($popupSize, $targetSize, $offset)
+    $x = $targetSize.Width - $popupSize.Width
+    , [System.Windows.Controls.Primitives.CustomPopupPlacement[]]@(
+        (New-Object System.Windows.Controls.Primitives.CustomPopupPlacement((New-Object System.Windows.Point($x, ($targetSize.Height + 6))), 'Horizontal')),
+        (New-Object System.Windows.Controls.Primitives.CustomPopupPlacement((New-Object System.Windows.Point($x, (-$popupSize.Height - 6))), 'Horizontal')))
+}
+function Open-SettingsMenu($b) {
+    if ($menu.IsOpen) { Close-Menu; return }
+    Build-Menu
+    $menu.Opacity = 0
+    $menu.PlacementTarget = $b
+    $menu.CustomPopupPlacementCallback = $GEAR_PLACEMENT
+    $menu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Custom
+    $menu.IsOpen = $true
+}
+# Baris bawah daftar: titik halaman di tengah (kalau ada dua halaman atau lebih), tombol pengaturan di kanan
+$script:listFooter = $null
+function New-ListFooter {
+    $g = New-Object System.Windows.Controls.Grid
+    $g.Height = 18; $g.Margin = '0,5,0,0'
+    [void]$g.Children.Add((New-SettingsButton))
+    $g
+}
 function New-PageDots {
     $sp = New-Object System.Windows.Controls.StackPanel
-    $sp.Orientation = 'Horizontal'; $sp.HorizontalAlignment = 'Center'; $sp.Margin = '0,8,0,0'; $sp.Height = 7
+    $sp.Orientation = 'Horizontal'; $sp.HorizontalAlignment = 'Center'; $sp.VerticalAlignment = 'Center'; $sp.Height = 7
     foreach ($p in (Get-ListPages)) { [void]$sp.Children.Add((New-PageDot $p)) }
     $sp
 }
@@ -4594,27 +4656,28 @@ function Update-PageDots {
     if ($pages.Count -lt 2) {
         # Tinggal satu halaman: baris titik menutup, island memendek
         if ($sp -and $sp.Parent) {
+            # Tinggal satu halaman: titik memudar sambil mengecil (barisnya tetap untuk tombol pengaturan,
+            # jadi tinggi island tidak berubah)
             $script:pageDots = $null
-            Resize-Island $WIDE_W (Get-ListTargetHeight $sp 0) 24 -Smooth -Ms 360
-            Animate60 $sp $hp 7.0 0.0 320
+            $sc = New-Object System.Windows.Media.ScaleTransform(1, 1); $sp.RenderTransformOrigin = '0.5,0.5'; $sp.RenderTransform = $sc
             Animate60 $sp $op 1.0 0.0 220
-            $sp.BeginAnimation($mp, (New-Object System.Windows.Media.Animation.ThicknessAnimation((New-Object System.Windows.Thickness(0)), (New-Object System.Windows.Duration (Ms 320)))))
+            Animate60 $sc ([System.Windows.Media.ScaleTransform]::ScaleXProperty) 1.0 0.6 260
+            Animate60 $sc ([System.Windows.Media.ScaleTransform]::ScaleYProperty) 1.0 0.6 260
             $script:dotsLeaving += $sp
             $dotsCleanupTimer.Stop(); $dotsCleanupTimer.Start()
         }
         return
     }
     if (-not $sp -or -not $sp.Parent) {
-        # Baris titik muncul: island memanjang, titik membesar & menampak
+        # Titik halaman muncul di baris bawah (yang sudah ada untuk tombol pengaturan): menampak sambil membesar
         $sp = New-PageDots
-        $sp.Height = 0; $sp.Opacity = 0; $sp.Margin = '0'
-        [void]$listPanel.Children.Add($sp)
+        $sp.Opacity = 0
+        $sc = New-Object System.Windows.Media.ScaleTransform(0.6, 0.6); $sp.RenderTransformOrigin = '0.5,0.5'; $sp.RenderTransform = $sc
+        if ($script:listFooter -and $script:listFooter.Parent) { $script:listFooter.Children.Insert(0, $sp) } else { [void]$listPanel.Children.Add($sp) }
         $script:pageDots = $sp
-        # Titik setinggi 7 + jarak 8 di atasnya
-        Resize-Island $WIDE_W (Get-ListTargetHeight $sp 15) 24 -Smooth -Ms 360
-        Animate60 $sp $hp 0.0 7.0 320
-        Animate60 $sp $op 0.0 1.0 300 80
-        $sp.BeginAnimation($mp, (New-Object System.Windows.Media.Animation.ThicknessAnimation((New-Object System.Windows.Thickness(0)), (New-Object System.Windows.Thickness(0, 8, 0, 0)), (New-Object System.Windows.Duration (Ms 320)))))
+        Animate60 $sp $op 0.0 1.0 300 40
+        Animate60 $sc ([System.Windows.Media.ScaleTransform]::ScaleXProperty) 0.6 1.0 320
+        Animate60 $sc ([System.Windows.Media.ScaleTransform]::ScaleYProperty) 0.6 1.0 320
         return
     }
     # Titik halaman yang baru: menyelip masuk dari ukuran nol
@@ -5250,9 +5313,11 @@ function Show-List([switch]$Refresh) {
             [void]$listPanel.Children.Add($row)
         }
     }
-    # Titik halaman hanya kalau memang ada dua halaman
+    # Baris bawah: titik halaman (hanya kalau memang ada dua halaman) dan tombol pengaturan di kanan
+    $script:listFooter = New-ListFooter
     $script:pageDots = $null
-    if ($pages.Count -gt 1) { $script:pageDots = New-PageDots; [void]$listPanel.Children.Add($script:pageDots) }
+    if ($pages.Count -gt 1) { $script:pageDots = New-PageDots; $script:listFooter.Children.Insert(0, $script:pageDots) }
+    [void]$listPanel.Children.Add($script:listFooter)
     # Halaman lirik disiapkan di latar dari halaman mana pun (notifikasi atau musik), siap sebelum digeser ke sana
     if ($script:listPage -ne 'lyrics' -and $pages -contains 'lyrics') { $lyricsPrebuildTimer.Stop(); $lyricsPrebuildTimer.Start() }
     $listPanel.Measure((New-Object System.Windows.Size(($WIDE_W - 2), [double]::PositiveInfinity)))
@@ -5870,6 +5935,15 @@ function Remove-IslandItem($id) {
 # Tampil sekali setelah island diperbarui (pop-up, lalu tetap di daftar notifikasi sampai dihapus), dan lewat
 # menu "Yang baru di versi ini". Terbaru dulu; tiap versi berisi poin singkat dalam dua bahasa.
 $CHANGELOG = @(
+    @{ V = '1.3.10'
+        Id = @('Tombol pengaturan (ikon roda gigi) di kanan bawah daftar: tidak perlu klik kanan lagi',
+            '"Hapus semua" langsung menghapus, tanpa klik kedua',
+            'Island tidak ikut screenshot, rekaman, atau berbagi layar (Win+Shift+S, PrintScreen, Game Bar, OBS); bisa dimatikan di Tampilkan',
+            'Menu muncul dengan animasi halus')
+        En = @('Settings button (gear icon) at the bottom right of the list: no more right-clicking',
+            '"Clear all" clears right away, no second click',
+            'The island stays out of screenshots, recordings and screen sharing (Win+Shift+S, PrintScreen, Game Bar, OBS); can be turned off under Show',
+            'The menu appears with a smooth animation') }
     @{ V = '1.3.9'
         Id = @('Mode hemat daya baru (klik kanan > Mode hemat daya): animasi latar memakai setengah refresh layar dengan tempo tetap rata, CPU turun sampai separuh',
             'Otomatis aktif di PC tanpa akselerasi grafis dan di laptop yang sedang memakai baterai; di PC lain tampilan tetap seperti biasa',
@@ -6178,6 +6252,7 @@ $onToggle = {
         'Furigana' { $script:lyricIdx = -2; if ($script:mode -eq 'list') { Show-List -Refresh } }
         'MicCam' { Check-Sensors }
         'AppVolume' { Update-VolumeUI }
+        'HideInCapture' { Set-CaptureHidden }
         'Glow' {
             $showing = $script:mode -eq 'media' -or ($script:mode -eq 'idle' -and $script:miniOn -and $script:miniKey -ne 'clock') -or ($script:mode -eq 'list' -and $script:listPage -ne 'notif')
             if ($script:media -and $showing) { Set-Theme $script:media.Accent }
@@ -6229,6 +6304,7 @@ function Build-Menu {
     [void](Add-MI $sm (New-MI (T 'Headset Bluetooth tersambung' 'Bluetooth headset connected') 'Headset' $onToggle -Check -Checked $script:settings.Headset))
     [void](Add-MI $sm (New-MI (T 'Cahaya warna album' 'Album color glow') 'Glow' $onToggle -Check -Checked $script:settings.Glow))
     [void](Add-MI $sm (New-MI (T 'Pop-up lagu memudar saat kursor mendekat' 'Song pop-up fades when the mouse is near') 'PopupFade' $onToggle -Check -Checked $script:settings.PopupFade))
+    [void](Add-MI $sm (New-MI (T 'Sembunyikan island di screenshot & rekaman layar' 'Hide the island in screenshots & screen recordings') 'HideInCapture' $onToggle -Check -Checked $script:settings.HideInCapture))
     $em = Add-MI $menu (New-MI (T 'Ikon musik' 'Music icon'))
     $pickEq = {
         param($s, $e)
@@ -6622,6 +6698,11 @@ function Close-Menu {
     $menuCloseTimer.Start()
 }
 $menu.Add_Opened({
+    # Muncul halus: memudar masuk sambil turun sedikit (kebalikan dari saat ditutup)
+    $tt = New-Object System.Windows.Media.TranslateTransform(0, -6)
+    $menu.RenderTransform = $tt
+    Animate60 $menu ([System.Windows.UIElement]::OpacityProperty) 0.0 1.0 180
+    Animate60 $tt ([System.Windows.Media.TranslateTransform]::YProperty) (-6.0) 0.0 220
     $hoverTimer.Stop()
     $script:menuWasDown = $true
     $script:menuFg = [IslandNative]::Foreground()
@@ -6635,11 +6716,16 @@ $menu.Add_Closed({
         $el.RenderTransform = [System.Windows.Media.Transform]::Identity
     }
     $script:menuFading = @()
+    # Dibuka dari tombol pengaturan: lain kali (klik kanan) kembali muncul di posisi kursor, roda gigi kembali diam
+    $gear = $menu.PlacementTarget
+    if ($gear -and $gear.Tag -is [hashtable] -and $gear.Tag.Rot -and -not $gear.IsMouseOver) { Set-GearHover $gear $false }
+    $menu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::MousePoint
+    $menu.ClearValue([System.Windows.Controls.ContextMenu]::PlacementTargetProperty)
 })
 Build-Menu
 foreach ($el in $island, $hotZone) {
     $el.ContextMenu = $menu
-    $el.Add_ContextMenuOpening({ Build-Menu })
+    $el.Add_ContextMenuOpening({ Build-Menu; $menu.Opacity = 0 })
 }
 
 # Penanda muncul turun dari atas sambil melebar saat island baru jalan
@@ -6672,12 +6758,21 @@ function Exit-Island {
     $exitTimer.Start()
 }
 
+# Island tidak ikut tertangkap screenshot, rekaman, atau berbagi layar (tetap tampil di monitor), supaya tidak
+# menutupi isi layar yang sedang diambil. Bisa dimatikan dari menu untuk men-screenshot island-nya sendiri.
+function Set-CaptureHidden {
+    if (-not $script:hwnd) { return }
+    $want = if ($script:settings.HideInCapture) { 0x11 } else { 0 }
+    try { if (-not [IslandNative]::SetWindowDisplayAffinity($script:hwnd, $want)) { Log "capture: affinity $want failed" } } catch { Log "capture: $_" }
+}
+
 $window.Add_SourceInitialized({
     $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
     $script:hwnd = $hwnd
     $GWL_EXSTYLE = -20; $WS_EX_TOOLWINDOW = 0x80; $WS_EX_NOACTIVATE = 0x08000000
     $style = [IslandNative]::GetWindowLong($hwnd, $GWL_EXSTYLE)
     [void][IslandNative]::SetWindowLong($hwnd, $GWL_EXSTYLE, ($style -bor $WS_EX_TOOLWINDOW -bor $WS_EX_NOACTIVATE))
+    Set-CaptureHidden
     try {
         $script:hwheel = New-Object HWheelHook($hwnd)
         $script:hwheel.add_Scrolled({
