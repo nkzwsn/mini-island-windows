@@ -37,12 +37,12 @@ and what's playing, instead of the toasts in the bottom-right corner.
 - **Bluetooth headset connected**: the device name and its battery (when the headset reports it).
 - **Microphone / camera in use**: an orange (mic) or green (camera) dot next to the thin line. Hover
   it to see which app is using it.
-- **Timer & stopwatch** (right-click menu). The time shows in the island, or in a small bubble next to
+- **Timer & stopwatch** (settings menu). The time shows in the island, or in a small bubble next to
   it while music plays. Pause or stop it from the notification list.
 - **Updates**: a new version shows up once as a pop-up, then stays in the notification list with a short
   list of what changed. Click it to install: the island downloads the new version, keeps your settings
   and saved lyrics, and restarts itself. Afterwards it shows once what's new in that version (see it
-  again with right-click > What's new in this version).
+  again with the gear > What's new in this version).
 - **English or Indonesian** interface, and a choice of monitor if you have more than one.
 - Stays on top of other windows, but steps aside for fullscreen games and videos.
 - Smooth: animations run at your screen's refresh rate.
@@ -69,16 +69,21 @@ Double-click **`Uninstall.cmd`** (in the downloaded folder or in `%LOCALAPPDATA%
 
 ## Settings
 
-**Right-click** the island, or the thin line at the top center when the island is hidden. The menu has:
+Open the list (move the mouse onto the island, or the thin line at the top center when it is hidden) and
+click the **gear** at its bottom right. The menu has:
 
 - Lyrics on/off, furigana and romaji on/off, and lyric timing for all songs (if lyrics are early or late for your
   speakers/headset)
 - Music volume: the player app only (default), or turn it off to have the music card change Windows' volume
 - Timer (1-60 minutes) and stopwatch
 - Show: volume & brightness changes, charging & low battery, microphone / camera dots, Bluetooth
-  headset, album color glow, and whether the song pop-up fades when the mouse is near
+  headset, album color glow, whether the song pop-up fades when the mouse is near, and whether the
+  island is hidden from screenshots, recordings and screen sharing (on by default; it stays visible on
+  your screen)
 - Music icon: bars, wave, spectrum, dots, vinyl record, or shuffle per song (the menu stays open so you
   can try each one)
+- Power saving mode: Automatic (on for PCs without graphics acceleration and laptops on battery),
+  Always, or Off. Animations then run at half your refresh rate, with even pacing
 - Monitor, language, check for updates, what's new in this version, restart, quit
 
 **Lyric timing for one song**: scroll on the lyrics button of the music card. It is remembered for

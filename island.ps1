@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.10'
+$APP_VERSION = '1.3.11'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -4593,8 +4593,13 @@ $GEAR_PLACEMENT = [System.Windows.Controls.Primitives.CustomPopupPlacementCallba
         (New-Object System.Windows.Controls.Primitives.CustomPopupPlacement((New-Object System.Windows.Point($x, ($targetSize.Height + 6))), 'Horizontal')),
         (New-Object System.Windows.Controls.Primitives.CustomPopupPlacement((New-Object System.Windows.Point($x, (-$popupSize.Height - 6))), 'Horizontal')))
 }
+# Klik kedua pada roda gigi menutup menu. Tekanannya sudah menutup menu (klik di luar menu), lalu lepasnya sampai
+# ke tombol ini: kalau menu baru saja ditutup (< 0,5 detik), jangan dibuka lagi (dulu menu tertutup lalu terbuka
+# lagi, seperti di-refresh).
+$script:menuClosedAt = [DateTime]::MinValue
 function Open-SettingsMenu($b) {
     if ($menu.IsOpen) { Close-Menu; return }
+    if (([DateTime]::UtcNow - $script:menuClosedAt).TotalMilliseconds -lt 500) { return }
     Build-Menu
     $menu.Opacity = 0
     $menu.PlacementTarget = $b
@@ -5935,21 +5940,26 @@ function Remove-IslandItem($id) {
 # Tampil sekali setelah island diperbarui (pop-up, lalu tetap di daftar notifikasi sampai dihapus), dan lewat
 # menu "Yang baru di versi ini". Terbaru dulu; tiap versi berisi poin singkat dalam dua bahasa.
 $CHANGELOG = @(
+    @{ V = '1.3.11'
+        Id = @('Pengaturan sekarang hanya lewat tombol roda gigi di kanan bawah daftar; klik kanan tidak lagi membuka menu',
+            'Klik roda gigi sekali lagi menutup menu (dulu menu malah terbuka ulang)')
+        En = @('Settings now open only from the gear button at the bottom right of the list; right-click no longer opens a menu',
+            'Clicking the gear again closes the menu (it used to reopen)') }
     @{ V = '1.3.10'
-        Id = @('Tombol pengaturan (ikon roda gigi) di kanan bawah daftar: tidak perlu klik kanan lagi',
+        Id = @('Tombol pengaturan (ikon roda gigi) di kanan bawah daftar',
             '"Hapus semua" langsung menghapus, tanpa klik kedua',
             'Island tidak ikut screenshot, rekaman, atau berbagi layar (Win+Shift+S, PrintScreen, Game Bar, OBS); bisa dimatikan di Tampilkan',
             'Menu muncul dengan animasi halus')
-        En = @('Settings button (gear icon) at the bottom right of the list: no more right-clicking',
+        En = @('Settings button (gear icon) at the bottom right of the list',
             '"Clear all" clears right away, no second click',
             'The island stays out of screenshots, recordings and screen sharing (Win+Shift+S, PrintScreen, Game Bar, OBS); can be turned off under Show',
             'The menu appears with a smooth animation') }
     @{ V = '1.3.9'
-        Id = @('Mode hemat daya baru (klik kanan > Mode hemat daya): animasi latar memakai setengah refresh layar dengan tempo tetap rata, CPU turun sampai separuh',
+        Id = @('Mode hemat daya baru (roda gigi > Mode hemat daya): animasi latar memakai setengah refresh layar dengan tempo tetap rata, CPU turun sampai separuh',
             'Otomatis aktif di PC tanpa akselerasi grafis dan di laptop yang sedang memakai baterai; di PC lain tampilan tetap seperti biasa',
             'Progress bar tidak lagi membuat island digambar ulang terus-menerus',
             'Memori lebih hemat pada pemakaian lama (simpanan lirik & furigana dibatasi)')
-        En = @('New power saving mode (right-click > Power saving mode): background animations run at half your refresh rate with even pacing, up to half the CPU',
+        En = @('New power saving mode (gear > Power saving mode): background animations run at half your refresh rate with even pacing, up to half the CPU',
             'Turns on by itself on PCs without graphics acceleration and on laptops running on battery; elsewhere nothing changes',
             'The progress bar no longer makes the island redraw all the time',
             'Uses less memory over long sessions (stored lyrics & furigana are capped)') }
@@ -5969,23 +5979,23 @@ $CHANGELOG = @(
             'Steadier furigana reader') }
     @{ V = '1.3.6'
         Id = @('Pop-up lagu baru ikut transparan saat kursor mendekat, seperti mini island',
-            'Bisa dimatikan: klik kanan > Tampilkan > Pop-up lagu memudar saat kursor mendekat',
+            'Bisa dimatikan: roda gigi > Tampilkan > Pop-up lagu memudar saat kursor mendekat',
             'Garis tipis di atas island juga membuka daftar saat pop-up lagu tampil',
-            'Catatan seperti ini muncul setelah tiap update (klik kanan > Yang baru di versi ini)')
+            'Catatan seperti ini muncul setelah tiap update (roda gigi > Yang baru di versi ini)')
         En = @('The new-song pop-up turns see-through when the mouse is near, like the mini island',
-            'Turn it off: right-click > Show > Song pop-up fades when the mouse is near',
+            'Turn it off: gear > Show > Song pop-up fades when the mouse is near',
             'The thin line above the island also opens the list while a song pop-up shows',
-            "A note like this appears after each update (right-click > What's new in this version)") }
+            "A note like this appears after each update (gear > What's new in this version)") }
     @{ V = '1.3.5'
         Id = @('Gelombang progress lebih alami: 4 lapis yang masing-masing bergerak sendiri')
         En = @('More natural progress wave: four uneven layers that each move on their own') }
     @{ V = '1.3.4'
         Id = @('Animasi lebih mulus, mengikuti refresh rate layar', 'Tidak ada lagi jeda acak saat memori dibersihkan',
             'Ganti baris lirik tidak tersendat lagi', 'Furigana/romaji di halaman lirik mengikuti baris yang sedang dinyanyikan',
-            '5 gaya ikon musik (klik kanan > Ikon musik)')
+            '5 gaya ikon musik (roda gigi > Ikon musik)')
         En = @("Smoother animations at your screen's refresh rate", 'No more random freezes while memory is cleaned up',
             'Lyric line changes no longer stutter', 'Furigana/romaji on the lyrics page follow the line being sung',
-            '5 music icon styles (right-click > Music icon)') }
+            '5 music icon styles (gear > Music icon)') }
     @{ V = '1.3.3'
         Id = @('Geser ke halaman lirik tidak tersendat lagi', 'Furigana/romaji nyala-mati dengan halus', 'Gelombang progress mengalir lebih cepat')
         En = @('Swiping to the lyrics page no longer freezes', 'Furigana/romaji turn on and off smoothly', 'Faster flowing progress wave') }
@@ -6635,7 +6645,7 @@ $island.Add_MouseLeftButtonUp({
     elseif ($script:mode -eq 'activity') { Click-Activity }
 })
 
-# Menu klik kanan: di island yang terbuka maupun di garis penanda di atasnya (island diam / mini island)
+# Menu pengaturan: dibuka dari tombol roda gigi di kanan bawah daftar (lihat Open-SettingsMenu)
 $menu = New-Object System.Windows.Controls.ContextMenu
 try { $menu.Resources = [Windows.Markup.XamlReader]::Parse($MENU_XAML) } catch { Log "menu style: $_" }
 # Island tidak pernah jadi jendela aktif (supaya tidak mencuri fokus), sehingga WPF tidak tahu saat
@@ -6687,6 +6697,7 @@ $menuCloseTimer.Interval = Ms 220
 $menuCloseTimer.Add_Tick({ $menuCloseTimer.Stop(); $menu.IsOpen = $false })
 function Close-Menu {
     if (-not $menu.IsOpen -or $menuCloseTimer.IsEnabled) { return }
+    $script:menuClosedAt = [DateTime]::UtcNow
     $menuWatch.Stop()
     $script:menuFading = (Get-MenuBoxes).ToArray()
     foreach ($el in $script:menuFading) {
@@ -6716,17 +6727,19 @@ $menu.Add_Closed({
         $el.RenderTransform = [System.Windows.Media.Transform]::Identity
     }
     $script:menuFading = @()
-    # Dibuka dari tombol pengaturan: lain kali (klik kanan) kembali muncul di posisi kursor, roda gigi kembali diam
+    # Roda gigi kembali diam (kalau kursor sudah tidak di atasnya)
     $gear = $menu.PlacementTarget
     if ($gear -and $gear.Tag -is [hashtable] -and $gear.Tag.Rot -and -not $gear.IsMouseOver) { Set-GearHover $gear $false }
     $menu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::MousePoint
     $menu.ClearValue([System.Windows.Controls.ContextMenu]::PlacementTargetProperty)
 })
 Build-Menu
-foreach ($el in $island, $hotZone) {
-    $el.ContextMenu = $menu
-    $el.Add_ContextMenuOpening({ Build-Menu; $menu.Opacity = 0 })
-}
+# Menu hanya dibuka dari tombol pengaturan (roda gigi) di kanan bawah daftar; klik kanan tidak membuka apa-apa
+# Waktu menu tertutup (dengan cara apa pun) dicatat langsung dari status IsOpen: event Closed tidak selalu muncul
+# saat menu ditutup oleh tekanan di luar menu (lihat Open-SettingsMenu)
+[System.ComponentModel.DependencyPropertyDescriptor]::FromProperty([System.Windows.Controls.ContextMenu]::IsOpenProperty, [System.Windows.Controls.ContextMenu]).AddValueChanged($menu, [EventHandler]{
+    if (-not $menu.IsOpen) { $script:menuClosedAt = [DateTime]::UtcNow }
+})
 
 # Penanda muncul turun dari atas sambil melebar saat island baru jalan
 $handle.RenderTransform = New-Object System.Windows.Media.TranslateTransform(0, -12)
