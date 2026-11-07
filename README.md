@@ -44,6 +44,8 @@ and what's playing, instead of the toasts in the bottom-right corner.
   and saved lyrics, and restarts itself. Afterwards it shows once what's new in that version (see it
   again with the gear > What's new in this version).
 - **English or Indonesian** interface, and a choice of monitor if you have more than one.
+- **Moves between monitors by itself** if you want (gear > Monitor > Move automatically): away from
+  fullscreen videos and games, or always to the monitor you are not using. It fades out and back in.
 - Stays on top of other windows, but steps aside for fullscreen games and videos.
 - Smooth: animations run at your screen's refresh rate.
 - Light: well under 1% of your CPU when nothing is playing, about 2-3% while music plays (measured on a
@@ -84,7 +86,7 @@ click the **gear** at its bottom right. The menu has:
   can try each one)
 - Power saving mode: Automatic (on for PCs without graphics acceleration and laptops on battery),
   Always, or Off. Animations then run at half your refresh rate, with even pacing
-- Monitor, language, check for updates, what's new in this version, restart, quit
+- Monitor (and moving automatically to another monitor), language, check for updates, what's new in this version, restart, quit
 
 **Lyric timing for one song**: scroll on the lyrics button of the music card. It is remembered for
 that song.

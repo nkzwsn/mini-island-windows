@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.12'
+$APP_VERSION = '1.3.13'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -23,10 +23,13 @@ $settingsFile = Join-Path $here 'settings.json'
 # LastVersion: versi island saat terakhir jalan (catatan perubahan tampil sekali setelah diperbarui).
 # Eco: mode hemat daya 'auto' (PC lebih lemah / laptop pakai baterai), 'on' (selalu), 'off' (tidak pernah).
 # HideInCapture: island tidak ikut screenshot (Win+Shift+S, PrintScreen, Game Bar, OBS, berbagi layar).
+# AutoMonitor: island pindah sendiri ke monitor lain: 'off', 'fullscreen' (saat video/game fullscreen menutupi
+# monitornya), 'unused' (selalu di monitor yang sedang tidak dipakai). Monitor tetap jadi tempat asalnya.
 $script:settings = [PSCustomObject]@{
     Lyrics = $true; Romaji = $true; Furigana = $true; LyricDelay = 0.15; Language = ''; Monitor = ''
     VolumeOsd = $true; Charging = $true; MicCam = $true; Headset = $true; Glow = $true; CheckUpdates = $true; SkipVersion = ''; NotifiedVersion = ''
     AppVolume = $true; EqStyle = 'bars'; PopupFade = $true; LastVersion = ''; Eco = 'auto'; HideInCapture = $true
+    AutoMonitor = 'off'
 }
 # Belum ada settings.json = pemasangan baru (tidak perlu catatan perubahan)
 $script:hadSettings = Test-Path $settingsFile
@@ -146,6 +149,37 @@ public static class IslandNative {
         // Hanya aplikasi di monitor tempat island berada yang dihitung
         IntPtr mon = MonitorFromWindow(h, 2);
         if (mon != MonitorFromWindow(self, 2)) return false;
+        return IsFullscreenOn(h, mon);
+    }
+
+    // Monitor jendela aplikasi di depan (pojok kiri-atasnya dalam piksel) dan apakah jendela itu fullscreen di sana.
+    // false kalau yang di depan bukan aplikasi (desktop, taskbar, island sendiri).
+    public static bool ForegroundMonitor(IntPtr self, out int left, out int top, out bool fullscreen, out IntPtr window) {
+        left = 0; top = 0; fullscreen = false;
+        IntPtr h = GetForegroundWindow(); window = h;
+        if (h == IntPtr.Zero || h == self) return false;
+        var cls = new System.Text.StringBuilder(64);
+        GetClassName(h, cls, 64);
+        string c = cls.ToString();
+        if (c == "Progman" || c == "WorkerW" || c == "Shell_TrayWnd" || c == "Shell_SecondaryTrayWnd") return false;
+        IntPtr mon = MonitorFromWindow(h, 2);
+        var mi = new MONITORINFO(); mi.Size = Marshal.SizeOf(typeof(MONITORINFO));
+        if (!GetMonitorInfo(mon, ref mi)) return false;
+        left = mi.Monitor.L; top = mi.Monitor.T;
+        fullscreen = IsFullscreenOn(h, mon);
+        return true;
+    }
+
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    // Jendela ini (yang tadi fullscreen) masih ada dan masih menutupi monitornya, walau tidak lagi di depan
+    public static bool WindowFullscreen(IntPtr h) {
+        if (h == IntPtr.Zero || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
+        return IsFullscreenOn(h, MonitorFromWindow(h, 2));
+    }
+
+    static bool IsFullscreenOn(IntPtr h, IntPtr mon) {
         // 3 = game Direct3D fullscreen eksklusif (dicek setelah monitor: game di monitor lain tidak dihitung)
         int state;
         bool exclusive = SHQueryUserNotificationState(out state) == 0 && state == 3;
@@ -1709,8 +1743,8 @@ function Next-Queued {
     $null
 }
 
-# Layar tempat island berada (pilihan di menu; kembali ke layar utama kalau monitornya dicabut)
-function Get-IslandScreen {
+# Monitor asal island (pilihan di menu; kembali ke layar utama kalau monitornya dicabut)
+function Get-HomeScreen {
     $all = [System.Windows.Forms.Screen]::AllScreens
     $s = $null
     if ($script:settings.Monitor) { $s = $all | Where-Object { $_.DeviceName -eq $script:settings.Monitor } | Select-Object -First 1 }
@@ -1718,9 +1752,78 @@ function Get-IslandScreen {
     $s
 }
 
+# Layar tempat island berada sekarang. AutoMonitor 'fullscreen': pindah dari monitor yang tertutup video/game
+# fullscreen; 'unused': juga menjauh dari monitor yang sedang dipakai (jendela di depan). Jendela fullscreen
+# diingat sampai tidak fullscreen lagi, jadi island tidak kembali menutupi video yang masih jalan saat pengguna
+# bekerja di monitor lain. Pindah baru terjadi setelah keadaannya bertahan 2 detik (alt-tab sekilas tidak membuat
+# island melompat), dan tidak selama island sedang dipakai.
+$script:autoScreen = $null; $script:autoWant = $null; $script:autoSince = [DateTime]::MinValue; $script:fsWindow = [IntPtr]::Zero
+function Get-IslandScreen {
+    $homeS = Get-HomeScreen
+    $all = @([System.Windows.Forms.Screen]::AllScreens)
+    if ($script:settings.AutoMonitor -notin 'fullscreen', 'unused' -or $all.Count -lt 2 -or -not $script:hwnd) { $script:autoScreen = $null; return $homeS }
+    $cur = if ($script:autoScreen) { $all | Where-Object { $_.DeviceName -eq $script:autoScreen } | Select-Object -First 1 } else { $null }
+    if (-not $cur) { $cur = $homeS }
+    if ($script:hovering -or $menu.IsOpen -or [System.Windows.Input.Mouse]::Captured) { return $cur }
+    $l = 0; $t = 0; $fs = $false; $fw = [IntPtr]::Zero
+    $fg = $null
+    if ([IslandNative]::ForegroundMonitor($script:hwnd, [ref]$l, [ref]$t, [ref]$fs, [ref]$fw)) {
+        $fg = $all | Where-Object { $_.Bounds.X -eq $l -and $_.Bounds.Y -eq $t } | Select-Object -First 1
+        if ($fs) { $script:fsWindow = $fw }
+    }
+    $blocked = @()
+    if ($script:fsWindow -ne [IntPtr]::Zero) {
+        if ([IslandNative]::WindowFullscreen($script:fsWindow)) {
+            $fsMon = [System.Windows.Forms.Screen]::FromHandle($script:fsWindow)
+            if ($fsMon) { $blocked += $fsMon.DeviceName }
+        } else { $script:fsWindow = [IntPtr]::Zero }
+    }
+    if ($script:settings.AutoMonitor -eq 'unused' -and $fg) { $blocked += $fg.DeviceName }
+    $want = if ($blocked -notcontains $homeS.DeviceName) { $homeS } else {
+        $all | Where-Object { $blocked -notcontains $_.DeviceName } | Sort-Object { -not $_.Primary } | Select-Object -First 1
+    }
+    # Semua monitor terpakai: tetap di tempat asal (aplikasi fullscreen di sana membuat island menyingkir seperti biasa)
+    if (-not $want) { $want = $homeS }
+    if ($want.DeviceName -eq $cur.DeviceName) { $script:autoWant = $null; return $cur }
+    if ($script:autoWant -ne $want.DeviceName) { $script:autoWant = $want.DeviceName; $script:autoSince = [DateTime]::UtcNow; return $cur }
+    if (([DateTime]::UtcNow - $script:autoSince).TotalSeconds -lt 2) { return $cur }
+    $script:autoWant = $null
+    $script:autoScreen = if ($want.DeviceName -eq $homeS.DeviceName) { $null } else { $want.DeviceName }
+    $want
+}
+
 # Posisi ikut berubah kalau resolusi/scaling layar diganti atau monitor dipilih/dicabut.
 # Koordinat layar (piksel) diubah ke satuan WPF memakai skala DPI jendela.
+# Pindah ke monitor lain (otomatis atau dipilih di menu) tidak meloncat: seluruh island memudar keluar, jendelanya
+# dipindah selagi tidak terlihat, lalu memudar masuk sambil turun sedikit di monitor baru
+$script:posScreen = $null
+$monitorMoveTimer = New-Object System.Windows.Threading.DispatcherTimer
+$monitorMoveTimer.Interval = Ms 230
+$monitorMoveTimer.Add_Tick({
+    $monitorMoveTimer.Stop()
+    Set-WindowPosition
+    $root = $window.Content
+    $tt = New-Object System.Windows.Media.TranslateTransform(0, -10)
+    $root.RenderTransform = $tt
+    Animate60 $tt ([System.Windows.Media.TranslateTransform]::YProperty) (-10.0) 0.0 380
+    Fade-Smooth $root 1 320
+})
+
 function Update-Position {
+    if ($monitorMoveTimer.IsEnabled) { return }
+    $s = Get-IslandScreen
+    if ($script:posScreen -and $script:posScreen -ne $s.DeviceName -and -not $script:exiting) {
+        $script:posScreen = $s.DeviceName
+        Fade-Smooth $window.Content 0 220
+        $monitorMoveTimer.Start()
+        return
+    }
+    $script:posScreen = $s.DeviceName
+    Set-WindowPosition
+}
+
+# Jendela di tengah atas monitor island. Koordinat layar (piksel) diubah ke satuan WPF memakai skala DPI jendela.
+function Set-WindowPosition {
     $b = (Get-IslandScreen).Bounds
     $k = 1.0
     try { $src = [System.Windows.PresentationSource]::FromVisual($window); if ($src) { $k = $src.CompositionTarget.TransformToDevice.M11 } } catch {}
@@ -6343,10 +6446,11 @@ function Build-Menu {
     $screens = @([System.Windows.Forms.Screen]::AllScreens)
     if ($screens.Count -gt 1) {
         $mm = Add-MI $menu (New-MI 'Monitor')
-        $cur = (Get-IslandScreen).DeviceName
+        $cur = (Get-HomeScreen).DeviceName
         $pickScreen = {
             param($s, $e)
             $script:settings.Monitor = $s.Tag
+            $script:autoScreen = $null; $script:autoWant = $null
             Save-Settings
             Update-Position
             Update-AnimFps
@@ -6358,6 +6462,22 @@ function Build-Menu {
             $tag = if ($sc.Primary) { '' } else { $sc.DeviceName }
             [void](Add-MI $mm (New-MI $name $tag $pickScreen -Check -Checked ($sc.DeviceName -eq $cur)))
             $i++
+        }
+        # Pindah otomatis: monitor di atas tetap jadi tempat asalnya
+        Add-Sep $mm
+        $am = Add-MI $mm (New-MI (T 'Pindah otomatis' 'Move automatically'))
+        $pickAuto = {
+            param($s, $e)
+            $script:settings.AutoMonitor = $s.Tag
+            $script:autoScreen = $null; $script:autoWant = $null; $script:fsWindow = [IntPtr]::Zero
+            Save-Settings
+            foreach ($it in $s.Parent.Items) { if ($it -is [System.Windows.Controls.MenuItem]) { $it.IsChecked = $it.Tag -eq $s.Tag } }
+            Update-Position
+        }
+        foreach ($o in @(@('off', 'Mati', 'Off'),
+                @('fullscreen', 'Menjauh dari video/game fullscreen', 'Away from fullscreen videos and games'),
+                @('unused', 'Selalu ke monitor yang tidak dipakai', 'Always to the monitor I am not using'))) {
+            [void](Add-MI $am (New-MI (T $o[1] $o[2]) $o[0] $pickAuto -Check -Checked ("$($script:settings.AutoMonitor)" -eq $o[0]) -Stay))
         }
     }
     $lm = Add-MI $menu (New-MI (T 'Bahasa' 'Language'))
