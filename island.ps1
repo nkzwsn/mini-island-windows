@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.8'
+$APP_VERSION = '1.3.9'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -21,10 +21,11 @@ $settingsFile = Join-Path $here 'settings.json'
 # EqStyle: gaya ikon musik di samping cover (bars, wave, spectrum, dots, disc; random = berganti tiap lagu).
 # PopupFade: pop-up lagu baru memudar seperti mini island selama kursor di dekatnya (mati: tetap tampil & bisa diklik).
 # LastVersion: versi island saat terakhir jalan (catatan perubahan tampil sekali setelah diperbarui).
+# Eco: mode hemat daya 'auto' (PC lebih lemah / laptop pakai baterai), 'on' (selalu), 'off' (tidak pernah).
 $script:settings = [PSCustomObject]@{
     Lyrics = $true; Romaji = $true; Furigana = $true; LyricDelay = 0.15; Language = ''; Monitor = ''
     VolumeOsd = $true; Charging = $true; MicCam = $true; Headset = $true; Glow = $true; CheckUpdates = $true; SkipVersion = ''; NotifiedVersion = ''
-    AppVolume = $true; EqStyle = 'bars'; PopupFade = $true; LastVersion = ''
+    AppVolume = $true; EqStyle = 'bars'; PopupFade = $true; LastVersion = ''; Eco = 'auto'
 }
 # Belum ada settings.json = pemasangan baru (tidak perlu catatan perubahan)
 $script:hadSettings = Test-Path $settingsFile
@@ -1787,6 +1788,32 @@ $MEDIA_H = 60
 # Semua animasi mengikuti refresh rate layar (mis. 100 fps di layar 100 Hz). Batas fps yang bukan kelipatan
 # refresh (mis. 60 fps di layar 100 Hz) membuat sebagian frame tampil dobel dan sebagian tertahan sampai
 # ~50 ms: gerakan jadi tersendat, terutama yang bergerak terus (gelombang, judul berjalan, sapuan lirik).
+# Mode hemat daya: semua animasi (juga transisi) memakai fps yang sama, sekitar 50 (tanpa akselerasi grafis ~30),
+# dengan pembagi pas dari refresh layar supaya jarak antar-frame tetap rata. Jendela island transparan, jadi
+# setiap frame digambar ulang seluruhnya: di PC tanpa akselerasi grafis island bisa memakan satu core CPU.
+# Otomatis aktif di PC tanpa akselerasi grafis dan di laptop yang sedang memakai baterai. (PC dengan prosesor
+# lemah tapi ada GPU, termasuk grafis Intel bawaan, tetap mulus di fps penuh: terukur 90-100 fps di 2 thread.)
+$script:ecoSoft = $false
+try { $script:ecoSoft = ([System.Windows.Media.RenderCapability]::Tier -shr 16) -lt 2 } catch {}
+$script:ecoOn = $false
+function Test-Eco {
+    switch ("$($script:settings.Eco)") { 'on' { return $true } 'off' { return $false } }
+    if ($script:ecoSoft) { return $true }
+    try {
+        $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
+        if ($ps.BatteryChargeStatus -band [System.Windows.Forms.BatteryChargeStatus]::NoSystemBattery) { return $false }
+        return "$($ps.PowerLineStatus)" -eq 'Offline'
+    } catch { return $false }
+}
+# Status hemat daya berubah (mis. charger dicabut, atau diubah dari menu): animasi latar dibuat ulang dengan fps baru
+function Check-Eco {
+    if ((Test-Eco) -eq $script:ecoOn) { return }
+    Update-AnimFps
+    if ($script:glowBreathing) { $script:glowBreathing = $false; Set-GlowBreath $true }
+    if ($script:mode -eq 'idle') { $script:miniKey = $null }
+    Media-Changed $false
+}
+
 function Update-AnimFps {
     # WPF menggambar mengikuti layar tercepat/utama, bukan layar tempat island berada. Batas animasi
     # diambil dari refresh tertinggi semua layar, supaya tiap frame layar mendapat posisi animasi baru.
@@ -1798,7 +1825,12 @@ function Update-AnimFps {
     # Animasi yang berjalan terus selama lagu diputar: juga setiap frame sampai ~165 Hz. Di layar yang lebih
     # cepat, setiap frame ke-2/ke-3 (pembagi pas, jadi jaraknya tetap rata) supaya CPU tidak terkuras.
     $k = [Math]::Ceiling($hz / 165.0)
+    # Hemat daya: setiap frame ke-2 (atau ke-3/ke-4 di layar sangat cepat) untuk SEMUA animasi, supaya temponya
+    # tetap rata (campuran 100 fps dan 50 fps membuat jarak antar-frame tidak rata = tersendat)
+    $script:ecoOn = Test-Eco
+    if ($script:ecoOn) { $k = [Math]::Max(2, [Math]::Ceiling($hz / $(if ($script:ecoSoft) { 31.0 } else { 51.0 }))) }
     $script:AMBIENT_FPS = if ($k -le 1) { $script:ANIM_FPS } else { [Math]::Round($hz / $k * 1.02) }
+    if ($script:ecoOn) { $script:ANIM_FPS = $script:AMBIENT_FPS }
     [IslandWave]::FrameTime = 1.0 / $script:AMBIENT_FPS - 0.002
 }
 $ANIM_FPS = 60
@@ -2701,11 +2733,17 @@ function Start-Progress($pb) {
     $knob.BeginAnimation($xp, $null); $knob.X = $f * $W - $half
     if ($m.Playing -and $f -lt 1) {
         $dur = New-Object System.Windows.Duration ([TimeSpan]::FromSeconds((1 - $f) * $m.End))
+        # Bergerak kurang dari 1 piksel per detik: fps-nya sama dengan animasi latar lain (tanpa batas, island
+        # digambar ulang di setiap frame layar selama lagu diputar, termasuk di mode hemat daya)
         foreach ($t in $pb.Movers) {
-            $t.BeginAnimation($xp, (New-Object System.Windows.Media.Animation.DoubleAnimation($W, $dur)))
+            $pa = New-Object System.Windows.Media.Animation.DoubleAnimation($W, $dur)
+            [System.Windows.Media.Animation.Timeline]::SetDesiredFrameRate($pa, $AMBIENT_FPS)
+            $t.BeginAnimation($xp, $pa)
             Track-Anim $pb.Root $t $xp
         }
-        $knob.BeginAnimation($xp, (New-Object System.Windows.Media.Animation.DoubleAnimation(($W - $half), $dur)))
+        $ka2 = New-Object System.Windows.Media.Animation.DoubleAnimation(($W - $half), $dur)
+        [System.Windows.Media.Animation.Timeline]::SetDesiredFrameRate($ka2, $AMBIENT_FPS)
+        $knob.BeginAnimation($xp, $ka2)
         Track-Anim $pb.Root $knob $xp
     }
     Update-ProgressTime $pb
@@ -3378,7 +3416,7 @@ function Request-Lyrics {
             # Versi lain lagu yang sama (mis. video klip lebih panjang) punya timing berbeda: cari ulang
             $fits = -not ($m.End -gt 0 -and $j.Duration -gt 0 -and [Math]::Abs([double]$j.Duration - $m.End) -gt 8)
             if ($fresh -and $fits) {
-                if ($lyricsCache.Count -gt 200) { $lyricsCache.Clear() }
+                if ($lyricsCache.Count -gt 50) { $lyricsCache.Clear() }
                 $lyricsCache[$m.Key] = New-LyricsEntry $j $file
                 Lyrics-Arrived
                 return
@@ -3512,7 +3550,7 @@ function Check-Lyrics {
     }
     if ((-not $pick -or -not $pick.Synced) -and $r.Plain) { $pick = $r.Plain }
     if (-not $pick) { $pick = @{ None = $true } }
-    if ($lyricsCache.Count -gt 200) { $lyricsCache.Clear() }
+    if ($lyricsCache.Count -gt 50) { $lyricsCache.Clear() }
     $e = New-LyricsEntry $pick $r.File
     $lyricsCache[$r.Key] = $e
     Save-LyricsEntry $e
@@ -3731,7 +3769,7 @@ public static class LyricReader {
         Enter();
         try {
             queue.Clear();
-            if (done.Count > 4000) done.Clear();
+            if (done.Count > 1500) done.Clear();
             int n = texts.Length;
             from = Math.Max(0, Math.Min(from, n));
             for (int i = from; i < n; i++) Enqueue(texts[i]);
@@ -5832,6 +5870,15 @@ function Remove-IslandItem($id) {
 # Tampil sekali setelah island diperbarui (pop-up, lalu tetap di daftar notifikasi sampai dihapus), dan lewat
 # menu "Yang baru di versi ini". Terbaru dulu; tiap versi berisi poin singkat dalam dua bahasa.
 $CHANGELOG = @(
+    @{ V = '1.3.9'
+        Id = @('Mode hemat daya baru (klik kanan > Mode hemat daya): animasi latar memakai setengah refresh layar dengan tempo tetap rata, CPU turun sampai separuh',
+            'Otomatis aktif di PC tanpa akselerasi grafis dan di laptop yang sedang memakai baterai; di PC lain tampilan tetap seperti biasa',
+            'Progress bar tidak lagi membuat island digambar ulang terus-menerus',
+            'Memori lebih hemat pada pemakaian lama (simpanan lirik & furigana dibatasi)')
+        En = @('New power saving mode (right-click > Power saving mode): background animations run at half your refresh rate with even pacing, up to half the CPU',
+            'Turns on by itself on PCs without graphics acceleration and on laptops running on battery; elsewhere nothing changes',
+            'The progress bar no longer makes the island redraw all the time',
+            'Uses less memory over long sessions (stored lyrics & furigana are capped)') }
     @{ V = '1.3.8'
         Id = @('Teks aneh yang bertumpuk berlebihan (huruf "zalgo" di chat, judul, atau lirik) tidak bisa lagi membuat island crash',
             'Pil headset Bluetooth tidak lagi menampilkan "-1%", baterainya kini dicari seperti seharusnya',
@@ -6193,6 +6240,17 @@ function Build-Menu {
     }
     Add-Sep $em
     [void](Add-MI $em (New-MI (T 'Acak tiap lagu' 'Shuffle per song') 'random' $pickEq -Check -Checked ($script:settings.EqStyle -eq 'random') -Stay))
+    $xm = Add-MI $menu (New-MI (T 'Mode hemat daya' 'Power saving mode'))
+    $pickEco = {
+        param($s, $e)
+        $script:settings.Eco = $s.Tag
+        Save-Settings
+        foreach ($it in $s.Parent.Items) { if ($it -is [System.Windows.Controls.MenuItem]) { $it.IsChecked = $it.Tag -eq $s.Tag } }
+        Check-Eco
+    }
+    foreach ($o in @(@('auto', 'Otomatis (PC tanpa GPU / pakai baterai)', 'Automatic (no graphics acceleration / on battery)'), @('on', 'Selalu', 'Always'), @('off', 'Mati', 'Off'))) {
+        [void](Add-MI $xm (New-MI (T $o[1] $o[2]) $o[0] $pickEco -Check -Checked ("$($script:settings.Eco)" -eq $o[0]) -Stay))
+    }
     $screens = @([System.Windows.Forms.Screen]::AllScreens)
     if ($screens.Count -gt 1) {
         $mm = Add-MI $menu (New-MI 'Monitor')
@@ -6382,6 +6440,7 @@ $pollTimer.Add_Tick({
     Queue-Job 'anims' { Prune-Anims }
     Queue-Job 'sensors' { Check-Sensors }
     Queue-Job 'power' { Check-Power }
+    if (($script:pollCount % 5) -eq 0) { Queue-Job 'eco' { Check-Eco } }
     Queue-Job 'update' { Check-Update }
     # Output audio bisa pindah (headset dicolok): pantau perangkat yang baru
     if ($script:volWatcher) {
