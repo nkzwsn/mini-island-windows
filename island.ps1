@@ -9,7 +9,7 @@ try { if ((Get-Item $logFile -ErrorAction Stop).Length -gt 512KB) { Remove-Item 
 function Log($msg) { try { Add-Content -Path $logFile -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg) } catch {} }
 
 # Versi ini dibandingkan dengan file VERSION di GitHub untuk cek update
-$APP_VERSION = '1.3.11'
+$APP_VERSION = '1.3.12'
 $REPO_URL = 'https://github.com/nkzwsn/mini-island-windows'
 
 # Pengaturan yang diingat antar-restart (diatur lewat menu klik kanan)
@@ -6090,7 +6090,9 @@ $UPDATE_DOWNLOAD_JOB = {
 }
 
 function Start-SelfUpdate {
-    if ($script:selfUpdateJob) { return }
+    # Sudah terpasang dan island tinggal restart (item update masih bisa diklik selama ~1 detik itu): jangan
+    # unduh dan pasang lagi, karena pemasangan kedua menimpa cadangan island.ps1.bak dengan versi baru
+    if ($script:selfUpdateJob -or $script:updateApplied -or $script:exiting) { return }
     $script:selfUpdateJob = Start-BgJob $UPDATE_DOWNLOAD_JOB @($REPO_ZIP)
     $updateTimer.Start()
     Show-Info (T 'Mengunduh update...' 'Downloading update...') 60000
@@ -6109,6 +6111,7 @@ $updateTimer.Add_Tick({
     }
     try {
         if ([version]$r.Version -le [version]$APP_VERSION) { Show-Info (T "Sudah versi terbaru (v$APP_VERSION)" "You're up to date (v$APP_VERSION)"); return }
+        $script:updateApplied = $true
         $self = Join-Path $here 'island.ps1'
         Copy-Item $self (Join-Path $here 'island.ps1.bak') -Force
         Copy-Item (Join-Path $r.Dir 'island.ps1') $self -Force
